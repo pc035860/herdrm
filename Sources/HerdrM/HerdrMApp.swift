@@ -171,6 +171,15 @@ struct HerdrMApp: App {
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .control])
                 .disabled(focusedSplitTree == nil)
+
+                Divider()
+
+                // No shortcut on purpose: the ⌘⌥/⌘⌃ arrow rows are full, and
+                // anything else risks a Ghostty keybind collision.
+                Button("Balance Split Panes") {
+                    focusedModel?.rebalanceSplits()
+                }
+                .disabled(focusedSplitTree == nil)
             }
             CommandGroup(replacing: .saveItem) {
                 // ⌘W closes the most local thing first: the focused split pane,

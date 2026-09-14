@@ -267,6 +267,34 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Rebalances every divider so each leaf gets an equal share: a node's
+    /// ratio becomes first-leaf-count / total-leaf-count (NOT 0.5 — a nested
+    /// `split(A, split(B, C))` at all-0.5 renders 50/25/25). Also resets the
+    /// persisted root `splitRatio`, so the next depth-1 split starts even
+    /// instead of restoring a pre-balance drag position.
+    func rebalanceSplits() {
+        func leafCount(_ node: SplitNode) -> Int {
+            switch node {
+            case .leaf: return 1
+            case .split(_, _, let first, let second): return leafCount(first) + leafCount(second)
+            }
+        }
+        func balanced(_ node: SplitNode) -> SplitNode {
+            switch node {
+            case .leaf: return node
+            case .split(let axis, _, let first, let second):
+                let balancedFirst = balanced(first)
+                let total = leafCount(first) + leafCount(second)
+                return .split(axis: axis, ratio: Double(leafCount(first)) / Double(total), first: balancedFirst, second: balanced(second))
+            }
+        }
+        splitRatio = 0.5
+        updateSplitTree { tree in
+            guard tree != nil else { return }
+            tree = balanced(tree!)
+        }
+    }
+
     /// Whether the tree still contains the pane (close-path reuse guard — a
     /// newer split may own a recycled pane ID).
     private func treeContainsPane(deviceID: UUID, paneID: String) -> Bool {
