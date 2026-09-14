@@ -508,27 +508,34 @@ struct DetailView: View {
                     }
                 }
             } second: {
-                ShellTerminalView(
-                    fontName: terminalFontName,
-                    fontSize: terminalFontSize,
-                    thinStrokes: terminalThinStrokes,
-                    fontWeight: terminalFontWeight,
-                    lineSpacing: terminalLineSpacing,
-                    dark: colorScheme == .dark,
-                    mouseReporting: terminalMouseReporting,
-                    onExit: { _ in model.shellSplitAxis = nil },
-                    onViewReady: {
-                        splitTracker.shellView = $0
-                        model.splitShellView = $0
-                    }
-                )
-                    // Deliberately not keyed on colorScheme like the attach above:
-                    // a new id tears the view down and kills the shell with whatever
-                    // was running in it, and unlike a herdr pane a local shell has no
-                    // server-side state to reattach to. updateNSView re-themes it.
-                    .id("shell")
+                // The split is a real herdr pane in the agent's workspace (same
+                // device), attached like any terminal — not a local shell. It is
+                // created by openSplit and closed when the axis clears; the id
+                // keys the attach to its pane so a new split rebuilds cleanly.
+                if let split = model.splitTerminal {
+                    AttachTerminalView(
+                        device: split.device,
+                        target: split.target,
+                        serverVersion: model.serverVersion(deviceID: split.device.id),
+                        attachmentCapabilities: nil,
+                        fontName: terminalFontName,
+                        fontSize: terminalFontSize,
+                        thinStrokes: terminalThinStrokes,
+                        fontWeight: terminalFontWeight,
+                        lineSpacing: terminalLineSpacing,
+                        dark: colorScheme == .dark,
+                        mouseReporting: terminalMouseReporting,
+                        onAttachmentError: { model.actionError = $0 },
+                        onExit: { _ in model.shellSplitAxis = nil },
+                        onViewReady: {
+                            splitTracker.shellView = $0
+                            model.splitShellView = $0
+                        }
+                    )
+                    .id("split-\(split.paneID)")
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Theme.terminalBackground)

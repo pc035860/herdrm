@@ -110,10 +110,10 @@ struct HerdrMApp: App {
                 // on screen there is no SplitContainer to render into, so a split would
                 // be invisible yet leave shellSplitAxis non-nil — and the next ⌘W would
                 // "close" that phantom instead of the window.
-                Button("Split Vertically") { focusedModel?.shellSplitAxis = .vertical }
+                Button("Split Vertically") { focusedModel?.openSplit(axis: .vertical) }
                     .keyboardShortcut("d", modifiers: .command)
                     .disabled(focusedModel?.selectedAttachedEntry == nil)
-                Button("Split Horizontally") { focusedModel?.shellSplitAxis = .horizontal }
+                Button("Split Horizontally") { focusedModel?.openSplit(axis: .horizontal) }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
                     .disabled(focusedModel?.selectedAttachedEntry == nil)
 

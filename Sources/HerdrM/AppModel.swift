@@ -150,7 +150,55 @@ final class AppModel: ObservableObject {
     @Published var showNewSpace = false
     @Published var showSearch = false
     @Published var isFileManagerActive = false
-    @Published var shellSplitAxis: SplitAxis?
+    @Published var shellSplitAxis: SplitAxis? {
+        // Every path that clears the axis (⌘W, selection loss, attach exit)
+        // funnels the server-side cleanup through here, so the split pane
+        // can never be stranded in the workspace.
+        didSet {
+            if oldValue != nil, shellSplitAxis == nil {
+                closeSplitTerminal()
+            }
+        }
+    }
+    /// The herdr pane behind the ⌘D split: a real server-side sibling pane in
+    /// the same tab — beside the agent, on the same device — not a local shell
+    /// and not a separate tab. Ephemeral by design: closing the split closes
+    /// the pane.
+    struct SplitTerminal: Equatable {
+        let device: Device
+        let paneID: String
+        let target: TerminalAttachTarget
+    }
+    @Published var splitTerminal: SplitTerminal?
+    /// Pane IDs concealed from the sidebar, search, and auto-selection while
+    /// the split owns them. Inserted right after `pane.split` (before the first
+    /// refresh can publish the new pane) and removed once `splitTerminal` takes
+    /// over or the pane is cleaned up — so the ephemeral pane never renders a
+    /// selectable row anywhere. Best-effort for one hop only: an event-driven
+    /// refresh landing between `pane.split` and conceal still flashes it for a
+    /// frame, then it self-heals on the next render.
+    private var concealedSplitPaneIDs = Set<String>()
+    /// The in-flight `openSplit` task, if any. Repeat ⌘D presses while the tab
+    /// is being created are ignored instead of stacking up panes.
+    private var splitOpenTask: Task<Void, Never>?
+
+    private static func splitPaneKey(deviceID: UUID, paneID: String) -> String {
+        "\(deviceID.uuidString)/\(paneID)"
+    }
+
+    /// Whether the pane is the ephemeral ⌘D split pane. Hidden everywhere so
+    /// it can never be double-attached: a second `--takeover` attach (from the
+    /// sidebar, search, auto-selection, or snapshot focus) would kick the
+    /// split's own attach, whose `onExit` then closes the pane the user just
+    /// opened. Device-scoped: pane IDs can collide across devices.
+    func isSplitPane(deviceID: UUID, paneID: String) -> Bool {
+        concealedSplitPaneIDs.contains(Self.splitPaneKey(deviceID: deviceID, paneID: paneID))
+            || (splitTerminal?.paneID == paneID && splitTerminal?.device.id == deviceID)
+    }
+
+    func isSplitPane(_ entry: TerminalEntry) -> Bool {
+        isSplitPane(deviceID: entry.device.id, paneID: entry.pane.paneID)
+    }
     /// Set by `reveal` when a jump lands while the ⌘D split is open, and consumed once the
     /// main window is key again. Only an actual jump sets it: dismissing the search with
     /// Escape never calls `reveal`, and the sidebar assigns `selectedPane` directly.
@@ -406,6 +454,10 @@ final class AppModel: ObservableObject {
 
     var visibleTerminals: [TerminalEntry] {
         var entries = devicesInScope.flatMap { terminalEntries(for: $0) }
+        // The ephemeral split pane is a real tab while open; keep it out of
+        // the sidebar (and drag targets, and auto-selection below) so it can
+        // never be double-attached — see isSplitPane.
+        entries.removeAll(where: { isSplitPane($0) })
         if let space = selectedSpace {
             entries = entries.filter {
                 $0.device.id == space.deviceID && $0.pane.workspaceID == space.workspaceID
@@ -614,6 +666,125 @@ final class AppModel: ObservableObject {
         if selectedShellID == id {
             selectedShellID = shellSessions.last?.id
             if let remaining = selectedShellID { ShellViewRegistry.focus(remaining) }
+        }
+    }
+
+    // MARK: - Split terminal (⌘D)
+
+    /// Opens the split as a sibling herdr pane beside the selected entry.
+    /// Re-pressing with the split open only re-aims the divider, keeping the
+    /// same pane — matching what re-setting the axis did for the old shell.
+    func openSplit(axis: SplitAxis) {
+        if splitTerminal != nil {
+            shellSplitAxis = axis
+            return
+        }
+        guard splitOpenTask == nil, let entry = selectedAttachedEntry else { return }
+        let device = entry.device
+        let entryID = entry.id
+        let targetPaneID = entry.ref.paneID
+        // herdrm's vertical split (side by side) is herdr's "right"; the
+        // horizontal split (stacked) is herdr's "down".
+        let direction: PaneSplitDirection = axis == .vertical ? .right : .down
+        // Start beside the agent: same working directory, so the split is
+        // continuous with whatever it was split from.
+        let cwd: String? = switch entry {
+        case .agent(let agentEntry): agentEntry.agent.cwd
+        case .terminal(let terminalEntry): terminalEntry.pane.cwd
+        }
+        splitOpenTask = Task {
+            // Only the current task may clear the slot: a cancelled task can
+            // resume after closeSplitTerminal already installed a newer one,
+            // and a blind nil-out would drop the dedup guard and orphan panes.
+            defer { if !Task.isCancelled { splitOpenTask = nil } }
+            let paneID: String
+            do {
+                // A true sibling split in the SAME tab (not a new tab): the
+                // herdr TUI sees the same side-by-side layout herdrm shows.
+                paneID = try await service(for: device).splitPane(
+                    paneID: targetPaneID,
+                    direction: direction,
+                    cwd: cwd
+                )
+            } catch {
+                actionError = actionErrorMessage(error, device: device)
+                return
+            }
+            let concealKey = Self.splitPaneKey(deviceID: device.id, paneID: paneID)
+            concealedSplitPaneIDs.insert(concealKey)
+            defer { concealedSplitPaneIDs.remove(concealKey) }
+            // The new pane may miss a coalesced refresh; retry boundedly before
+            // giving up, so a transient snapshot gap doesn't silently eat ⌘D.
+            var terminal: TerminalEntry?
+            for _ in 0..<3 {
+                await refresh(device.id)
+                if Task.isCancelled {
+                    try? await service(for: device).closePane(paneID: paneID)
+                    await refresh(device.id)
+                    return
+                }
+                terminal = terminalEntries(for: device).first(where: { $0.pane.paneID == paneID })
+                if terminal != nil { break }
+            }
+            guard
+                selectedAttachedEntry?.id == entryID,
+                let terminal
+            else {
+                // The selection moved on mid-flight, or the new tab never
+                // appeared: don't strand (or surface) a pane nobody asked for.
+                try? await service(for: device).closePane(paneID: paneID)
+                await refresh(device.id)
+                if terminal == nil {
+                    actionError = String(localized: "Could not open the split terminal.")
+                }
+                return
+            }
+            splitTerminal = SplitTerminal(
+                device: device,
+                paneID: paneID,
+                target: .terminal(terminalID: terminal.terminalID)
+            )
+            shellSplitAxis = axis
+        }
+    }
+
+    /// Closes the split's herdr pane, if any. Cleanup runs detached from the
+    /// UI state change, and pane-close failures are swallowed: the pane may
+    /// already be gone (taken over, closed from the sidebar), which is a fine
+    /// end state. Deliberately still closes on takeover — an ephemeral pane
+    /// has no second life outside the split, so collapsing without closing
+    /// would strand it with no UI left to reach it (it is hidden everywhere).
+    private func closeSplitTerminal() {
+        splitOpenTask?.cancel()
+        splitOpenTask = nil
+        guard let split = splitTerminal else { return }
+        // Re-cover before unpublishing: the success path already surrendered
+        // the conceal key at task end, so without this the dying pane renders
+        // a selectable sidebar row until closePane + refresh land.
+        let concealKey = Self.splitPaneKey(deviceID: split.device.id, paneID: split.paneID)
+        concealedSplitPaneIDs.insert(concealKey)
+        splitTerminal = nil
+        Task {
+            // Keep the conceal key until the post-close refresh lands: the pane
+            // still exists server-side for hundreds of ms, and dropping cover
+            // early would render a selectable row for a dying pane.
+            defer {
+                // Don't drop a newer split's cover if the server ever reuses
+                // pane IDs between the close above and this removal.
+                if let current = splitTerminal,
+                   current.paneID == split.paneID,
+                   current.device.id == split.device.id {
+                    // A newer split owns this key now; its own close cycle
+                    // will remove it.
+                } else {
+                    concealedSplitPaneIDs.remove(concealKey)
+                }
+            }
+            // The device may be gone (removed mid-split): don't resurrect a
+            // service — let alone spawn a local server — for a doomed close.
+            guard device(split.device.id) != nil else { return }
+            try? await service(for: split.device).closePane(paneID: split.paneID)
+            await refresh(split.device.id)
         }
     }
 
@@ -1016,7 +1187,9 @@ final class AppModel: ObservableObject {
             if selectedPane == nil {
                 if let focusedPaneID = snapshot.focusedPaneID,
                    paneIDs.contains(focusedPaneID),
-                   deviceFilter == nil || deviceFilter == deviceID {
+                   deviceFilter == nil || deviceFilter == deviceID,
+                   // Never auto-select the concealed split pane (see isSplitPane).
+                   !isSplitPane(deviceID: deviceID, paneID: focusedPaneID) {
                     let focused = PaneRef(deviceID: deviceID, paneID: focusedPaneID)
                     if selectedSpace == nil
                         || selectedAttachedEntry.map({

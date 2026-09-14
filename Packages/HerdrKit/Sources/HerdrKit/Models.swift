@@ -389,6 +389,13 @@ public enum HerdrError: Error, LocalizedError, Sendable {
 }
 
 /// What an embedded terminal attaches to: an agent pane or a bare herdr terminal.
+/// Wire direction for `pane.split`: the new sibling goes right (side by side)
+/// or down (stacked).
+public enum PaneSplitDirection: String, Sendable {
+    case right
+    case down
+}
+
 public enum TerminalAttachTarget: Sendable, Equatable {
     case agent(paneID: String)
     case terminal(terminalID: String)

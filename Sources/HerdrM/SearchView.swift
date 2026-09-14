@@ -48,7 +48,10 @@ struct SearchSheet: View {
                 || entry.device.name.lowercased().contains(q)
         }
         let terminals = model.devices.flatMap { model.terminalEntries(for: $0) }.filter { entry in
-            q.isEmpty
+            // The ephemeral split pane must never be jumpable: revealing it
+            // would double-attach it under --takeover — see isSplitPane.
+            guard !model.isSplitPane(entry) else { return false }
+            return q.isEmpty
                 || entry.title.lowercased().contains(q)
                 || (entry.pane.cwd?.lowercased().contains(q) ?? false)
                 || (entry.tab?.label.lowercased().contains(q) ?? false)
