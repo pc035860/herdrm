@@ -1043,6 +1043,12 @@ final class AppModel: ObservableObject {
     /// in the tree.
     private func pruneTerminalLeaf(deviceID: UUID, paneID: String) -> PrunedLeafRemoval? {
         guard splitTree != nil else { return nil }
+        // Returns the replacement for this position (nil = position empties)
+        // plus the removal record. Promotion happens ONLY at the removed
+        // leaf's parent (nil child → surviving sibling); ancestors rebuild
+        // around the replacement. Promoting at every level drops live
+        // subtrees (stranded server panes) or collapses the tree to a bare
+        // leaf (one pane fullscreen with the agent gone).
         func prune(_ node: SplitNode) -> (SplitNode?, PrunedLeafRemoval?) {
             switch node {
             case .leaf(.agent):
@@ -1054,29 +1060,30 @@ final class AppModel: ObservableObject {
             case .split(let axis, let ratio, let first, let second):
                 let (firstPruned, firstHit) = prune(first)
                 if var hit = firstHit {
-                    // A nil replacement means `first` was the removed leaf itself
-                    // (deeper removals always leave a collapsed subtree behind),
-                    // so the promoted sibling is `second` — unless a deeper
-                    // level already recorded one.
-                    if firstPruned == nil, hit.sibling == nil {
-                        hit.sibling = second
-                        hit.removedWasFirst = true
-                        hit.parentAxis = axis
+                    if let firstPruned {
+                        hit.tree = .split(axis: axis, ratio: ratio, first: firstPruned, second: second)
+                        return (hit.tree, hit)
                     }
-                    hit.tree = firstPruned ?? second
-                    return (firstPruned ?? second, hit)
+                    // `first` was the removed leaf itself: promote `second`.
+                    hit.sibling = second
+                    hit.removedWasFirst = true
+                    hit.parentAxis = axis
+                    hit.tree = second
+                    return (second, hit)
                 }
                 let (secondPruned, secondHit) = prune(second)
                 if var hit = secondHit {
-                    if secondPruned == nil, hit.sibling == nil {
-                        hit.sibling = first
-                        hit.removedWasFirst = false
-                        hit.parentAxis = axis
+                    if let secondPruned {
+                        hit.tree = .split(axis: axis, ratio: ratio, first: first, second: secondPruned)
+                        return (hit.tree, hit)
                     }
-                    hit.tree = secondPruned ?? first
-                    return (secondPruned ?? first, hit)
+                    hit.sibling = first
+                    hit.removedWasFirst = false
+                    hit.parentAxis = axis
+                    hit.tree = first
+                    return (first, hit)
                 }
-                return (.split(axis: axis, ratio: ratio, first: first, second: second), nil)
+                return (node, nil)
             }
         }
         let (_, hit) = prune(splitTree!)
