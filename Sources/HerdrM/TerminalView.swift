@@ -129,6 +129,13 @@ enum GhosttyRuntime {
             // HerdrM owns copy only while Ghostty has a local selection. With
             // no local selection, Command-C must reach a mouse-aware pane app.
             builder.withCustom("keybind", "super+c=unbind")
+            // herdrm owns panel splits, not Ghostty: its default super+d /
+            // super+shift+d (new_split) would be consumed before AppKit reaches
+            // the Terminal menu, so ⌘D/⇧⌘D did nothing visible in a host-managed
+            // session. Unbound here; the menu forwarding in
+            // LineBreakTerminalView.performKeyEquivalent is the other half.
+            builder.withCustom("keybind", "super+d=unbind")
+            builder.withCustom("keybind", "super+shift+d=unbind")
             // Agent TUI copy actions use OSC 52. Keep writes enabled explicitly
             // rather than depending on Ghostty's default clipboard policy.
             builder.withCustom("clipboard-write", "allow")
@@ -537,8 +544,16 @@ final class LineBreakTerminalView: AppTerminalView {
     // local only when Ghostty owns a selection; otherwise the physical key is
     // sent to the TUI now that its global copy binding is unbound above.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // The first responder is often a Ghostty-internal subview (Metal/input
+        // layer), not this view itself — requiring identity meant ⌘ shortcuts
+        // never reached the menu forwarding below and Ghostty ate them all
+        // (⌘D/⇧⌘D as its own new_split, ⌘N/⌘T as new_window/new_tab).
+        // Descendants count: a responder inside this view is still "the terminal
+        // has focus" for menu-shortcut purposes. (isDescendant(of:) is also true
+        // for the view itself, so no separate identity check is needed.)
         guard event.type == .keyDown,
-              window?.firstResponder === self
+              let responder = window?.firstResponder as? NSView,
+              responder.isDescendant(of: self)
         else {
             return super.performKeyEquivalent(with: event)
         }
@@ -560,6 +575,9 @@ final class LineBreakTerminalView: AppTerminalView {
         }
         // Ghostty consumes its default bindings before AppKit reaches the menu.
         // Give HerdrM's commands priority over those standalone-terminal actions.
+        // Menu priority over still-bound Ghostty actions (notably ⌘W
+        // close_surface) is deliberate: the app's close path closes
+        // split → shell → window.
         if modifiers.contains(.command), NSApp.mainMenu?.performKeyEquivalent(with: event) == true {
             return true
         }
