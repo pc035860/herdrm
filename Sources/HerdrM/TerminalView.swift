@@ -1090,7 +1090,9 @@ enum SplitLeafViewRegistry {
     static func view(for leaf: AppModel.SplitLeafID) -> LineBreakTerminalView? {
         lock.lock()
         defer { lock.unlock() }
-        return views[key(for: leaf)]?.view
+        let key = key(for: leaf)
+        guard let view = views[key]?.view else { views[key] = nil; return nil }
+        return view
     }
 
     /// Reverse lookup: the leaf whose registered view contains `view` (the view

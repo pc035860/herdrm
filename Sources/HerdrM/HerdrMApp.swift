@@ -32,10 +32,25 @@ private struct AppModelFocusedValueKey: FocusedValueKey {
 /// Commands read the model straight through `focusedModel`, so no other
 /// focused values are needed. (An earlier revision carried the split axis as
 /// its own focused value; directional commands made it obsolete.)
+/// The split tree travels as its own focused value, not read off the model.
+/// `Commands` gets the AppModel by reference and never subscribes to its
+/// objectWillChange, so reading tree state off `focusedModel` evaluates once
+/// and sticks: menu items stay disabled with a split open, and a disabled
+/// NSMenuItem does not fire its key equivalent. A value type changes identity,
+/// which does invalidate the commands body — measured on the old axis key,
+/// same mechanism here.
+private struct SplitTreeFocusedValueKey: FocusedValueKey {
+    typealias Value = AppModel.SplitNode
+}
 extension FocusedValues {
     var appModel: AppModel? {
         get { self[AppModelFocusedValueKey.self] }
         set { self[AppModelFocusedValueKey.self] = newValue }
+    }
+
+    var splitTree: AppModel.SplitNode? {
+        get { self[SplitTreeFocusedValueKey.self] }
+        set { self[SplitTreeFocusedValueKey.self] = newValue }
     }
 }
 
@@ -44,6 +59,7 @@ struct HerdrMApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage("app.theme") private var themePreference = "system"
     @FocusedValue(\.appModel) private var focusedModel
+    @FocusedValue(\.splitTree) private var focusedSplitTree
 
     private let updaterController: SPUStandardUpdaterController
 
@@ -98,10 +114,10 @@ struct HerdrMApp: App {
                 // yet arm state the next ⌘W would "close" instead of the window.
                 Button("Split Vertically") { focusedModel?.openSplit(axis: .vertical) }
                     .keyboardShortcut("d", modifiers: .command)
-                    .disabled(focusedModel?.splitTree == nil && focusedModel?.selectedAttachedEntry == nil)
+                    .disabled(focusedSplitTree == nil && focusedModel?.selectedAttachedEntry == nil)
                 Button("Split Horizontally") { focusedModel?.openSplit(axis: .horizontal) }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
-                    .disabled(focusedModel?.splitTree == nil && focusedModel?.selectedAttachedEntry == nil)
+                    .disabled(focusedSplitTree == nil && focusedModel?.selectedAttachedEntry == nil)
 
                 Divider()
 
@@ -116,22 +132,22 @@ struct HerdrMApp: App {
                     focusedModel?.focusNeighbor(.left)
                 }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
                 Button("Focus Right Pane") {
                     focusedModel?.focusNeighbor(.right)
                 }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
                 Button("Focus Top Pane") {
                     focusedModel?.focusNeighbor(.up)
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
                 Button("Focus Bottom Pane") {
                     focusedModel?.focusNeighbor(.down)
                 }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
 
                 Divider()
 
@@ -142,22 +158,22 @@ struct HerdrMApp: App {
                     focusedModel?.nudgeFocusedLeaf(arrow: .right)
                 }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .control])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
                 Button("Narrow Active Pane") {
                     focusedModel?.nudgeFocusedLeaf(arrow: .left)
                 }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .control])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
                 Button("Grow Active Pane") {
                     focusedModel?.nudgeFocusedLeaf(arrow: .down)
                 }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .control])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
                 Button("Shrink Active Pane") {
                     focusedModel?.nudgeFocusedLeaf(arrow: .up)
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .control])
-                .disabled(focusedModel?.splitTree == nil)
+                .disabled(focusedSplitTree == nil)
             }
             CommandGroup(replacing: .saveItem) {
                 // ⌘W closes the most local thing first: the focused split pane,
@@ -189,7 +205,7 @@ struct HerdrMApp: App {
     }
 
     private var closeButtonTitle: String {
-        if focusedModel?.splitTree != nil { return String(localized: "Close Split Pane") }
+        if focusedSplitTree != nil { return String(localized: "Close Split Pane") }
         if focusedModel?.selectedShell != nil { return String(localized: "Close Terminal") }
         return String(localized: "Close")
     }

@@ -31,7 +31,6 @@ final class SplitFocusTracker {
 
     private var keyWindowObservation: NSKeyValueObservation?
     private var firstResponderObservation: NSKeyValueObservation?
-    private var reportedLeaf: AppModel.SplitLeafID?
 
     func start() {
         keyWindowObservation = NSApp.observe(\.keyWindow, options: [.new]) { [weak self] _, _ in
@@ -52,11 +51,12 @@ final class SplitFocusTracker {
     }
 
     private func updateFocusedLeaf() {
+        // No dedup here (matching the old side tracker): the model diffs against
+        // its own focusedSplitLeaf, and a cached leaf would go stale across
+        // collapse/re-split cycles — e.g. a recycled pane ID suppressing a report.
         guard let responder = NSApp.keyWindow?.firstResponder as? NSView,
-              let leaf = resolveLeaf?(responder),
-              leaf != reportedLeaf
+              let leaf = resolveLeaf?(responder)
         else { return }
-        reportedLeaf = leaf
         onLeafChanged?(leaf)
     }
 

@@ -273,10 +273,11 @@ final class AppModel: ObservableObject {
         treeSplitPaneKeys().contains(Self.splitPaneKey(deviceID: deviceID, paneID: paneID))
     }
 
-    /// The device the tree lives on (any terminal leaf's device). By induction
-    /// — the same-device guard keeps agent-leaf splits on-tree, terminal
-    /// leaves inherit their pane's device — all leaves always share one
-    /// device, so this is well-defined. Used by the step-4 creation path.
+    /// The device the tree lives on (any terminal leaf's device). The agent
+    /// leaf is virtual — selection may point at another device's agent while a
+    /// tree is open — so this reads terminal leaves only; terminal leaves
+    /// always share one device by the same-device creation guard. Used by the
+    /// agent-leaf creation path.
     func treeDevice() -> Device? {
         terminalSplitPanes().first?.device
     }
@@ -792,7 +793,10 @@ final class AppModel: ObservableObject {
                 install: { [weak self] newPane in
                     // Root creation seeds the persisted ratio (the user's dragged
                     // position survives, as today); deeper nodes seed 0.5.
+                    // Guarded: a collapse racing the final hop must not resurrect
+                    // a tree whose pane the closer is concurrently shutting.
                     self?.updateSplitTree { tree in
+                        guard tree == nil else { return }
                         tree = .split(axis: axis, ratio: self?.splitRatio ?? 0.5, first: .leaf(.agent), second: .leaf(.terminal(newPane)))
                     }
                 }
@@ -943,16 +947,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Closes every split pane and clears the tree. Cleanup runs detached from
-    /// the UI state change, and pane-close failures are swallowed: a pane may
-    /// already be gone (taken over, closed from the sidebar), which is a fine
-    /// end state. Deliberately still closes on takeover — an ephemeral pane
-    /// has no second life outside the split, so collapsing without closing
-    /// would strand it with no UI left to reach it (it is hidden everywhere).
     /// Collapses the whole split tree, closing every split pane. Every path
     /// that ends the split (⌘W on the agent leaf, selection loss) funnels the
     /// server-side cleanup through here, so split panes can never be stranded
-    /// in the workspace.
+    /// in the workspace. Cleanup runs detached from the UI state change, and
+    /// pane-close failures are swallowed: a pane may already be gone (taken
+    /// over, closed from the sidebar), which is a fine end state. Deliberately
+    /// still closes on takeover — an ephemeral pane has no second life outside
+    /// the split, so collapsing without closing would strand it with no UI left
+    /// to reach it (it is hidden everywhere).
     func collapseSplitTree() {
         splitOpenTasks.values.forEach { $0.cancel() }
         splitOpenTasks.removeAll()
@@ -1001,8 +1004,7 @@ final class AppModel: ObservableObject {
     /// promoted sibling, on the side facing the removal. `pruned` carries the
     /// promotion record; falls back to the tree's first leaf.
     private func nearestSurvivingLeaf(after pruned: PrunedLeafRemoval) -> SplitLeafID? {
-        if let sibling = pruned.sibling, let axis = pruned.parentAxis {
-            _ = axis
+        if let sibling = pruned.sibling {
             // Removed was first (left/top) → the survivor sits right/below →
             // nearest is its leftmost/topmost leaf; removed second →
             // rightmost/bottommost.
@@ -1153,7 +1155,7 @@ final class AppModel: ObservableObject {
     /// split facing that way, then the extreme leaf of the sibling subtree).
     /// No geometry needed — the tree already encodes adjacency.
     func neighbor(of id: SplitLeafID, direction: SplitDirection) -> SplitLeafID? {
-        guard let tree = splitTree, let path = leafPath(id), !path.isEmpty else { return nil }
+        guard let tree = splitTree, let path = leafPath(id) else { return nil }
         let wantAxis: SplitAxis = (direction == .left || direction == .right) ? .vertical : .horizontal
         // Ancestor splits from nearest to root, with the taken child index.
         var node = tree
@@ -1184,13 +1186,15 @@ final class AppModel: ObservableObject {
         focusSplitLeaf(next)
     }
 
-    /// Puts the keyboard on a leaf's view. Falls back from the registry to the
-    /// last-known side views (agent side has no registry entry — its stack is
-    /// selection-dependent). The tracker's KVO report is the source of truth
-    /// for `focusedSplitLeaf`; this only moves the responder.
+    /// Puts the keyboard on a leaf's view. Falls back to the agent view for the
+    /// agent leaf only (it has no registry entry — its stack is
+    /// selection-dependent); a terminal leaf with no registered view simply
+    /// can't take focus, and guessing another pane's view would land the
+    /// keyboard in the wrong place. The tracker's KVO report is the source of
+    /// truth for `focusedSplitLeaf`; this only moves the responder.
     func focusSplitLeaf(_ id: SplitLeafID) {
         let view: NSView? = SplitLeafViewRegistry.view(for: id)
-            ?? (id == .agent ? splitAgentView : splitShellView)
+            ?? (id == .agent ? splitAgentView : nil)
         guard let view, let window = view.window else { return }
         window.makeFirstResponder(view)
     }
@@ -1212,7 +1216,7 @@ final class AppModel: ObservableObject {
     /// facing the other axis) — safe by the ⌘D lesson: never gate on
     /// `.disabled()`, just do nothing on unexpected focus.
     func nudgeFocusedLeaf(arrow: SplitDirection) {
-        guard splitTree != nil, let path = leafPath(focusedSplitLeaf), !path.isEmpty else { return }
+        guard splitTree != nil, let path = leafPath(focusedSplitLeaf) else { return }
         let wantAxis: SplitAxis = (arrow == .left || arrow == .right) ? .vertical : .horizontal
         // Nearest ancestor split (node path + taken index) with a matching axis.
         var node = splitTree

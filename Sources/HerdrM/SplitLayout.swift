@@ -17,11 +17,14 @@ let inactivePaneOpacity = 0.55
 
 /// One draggable divider, positioned by the layout pass. `path` is the child
 /// index trail from the root ([0] = first, [1] = second) and doubles as the
-/// stable identity and the ratio write-back address.
+/// stable identity and the ratio write-back address. `extent` is the owning
+/// node's size along the split axis — the drag denominator, which is the full
+/// canvas only at depth 1.
 struct SplitDividerLayout: Identifiable {
     let path: [Int]
     let axis: SplitAxis
     let ratio: Double
+    let extent: CGFloat
     let rect: CGRect
 
     var id: String { path.map(String.init).joined(separator: "/") }
@@ -49,11 +52,11 @@ func splitLayout(
                 * SplitContainerRatioBounds.clamp(ratio)
             if axis == .vertical {
                 lay(first, in: CGRect(x: rect.minX, y: rect.minY, width: firstLength, height: rect.height), path: path + [0])
-                dividers.append(SplitDividerLayout(path: path, axis: axis, ratio: ratio, rect: CGRect(x: rect.minX + firstLength, y: rect.minY, width: 1, height: rect.height)))
+                dividers.append(SplitDividerLayout(path: path, axis: axis, ratio: ratio, extent: rect.width, rect: CGRect(x: rect.minX + firstLength, y: rect.minY, width: 1, height: rect.height)))
                 lay(second, in: CGRect(x: rect.minX + firstLength + 1, y: rect.minY, width: max(0, rect.width - firstLength - 1), height: rect.height), path: path + [1])
             } else {
                 lay(first, in: CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: firstLength), path: path + [0])
-                dividers.append(SplitDividerLayout(path: path, axis: axis, ratio: ratio, rect: CGRect(x: rect.minX, y: rect.minY + firstLength, width: rect.width, height: 1)))
+                dividers.append(SplitDividerLayout(path: path, axis: axis, ratio: ratio, extent: rect.height, rect: CGRect(x: rect.minX, y: rect.minY + firstLength, width: rect.width, height: 1)))
                 lay(second, in: CGRect(x: rect.minX, y: rect.minY + firstLength + 1, width: rect.width, height: max(0, rect.height - firstLength - 1)), path: path + [1])
             }
         }

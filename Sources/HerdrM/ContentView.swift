@@ -50,6 +50,7 @@ struct RootView: View {
                 .hidden()
         )
         .focusedSceneValue(\.appModel, model)
+        .focusedSceneValue(\.splitTree, model.splitTree)
         .sheet(isPresented: $model.showSearch) { SearchSheet(model: model) }
         .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: 980, minHeight: 620)
@@ -530,7 +531,7 @@ struct DetailView: View {
                     SplitCanvasDivider(
                         axis: divider.axis,
                         ratio: divider.ratio,
-                        total: divider.axis == .vertical ? proxy.size.width : proxy.size.height,
+                        total: divider.extent,
                         onDrag: { model.setSplitRatio($0, at: divider.path) }
                     )
                     .frame(width: divider.rect.width, height: divider.rect.height)
@@ -599,9 +600,11 @@ struct DetailView: View {
         var body: some View {
             Rectangle()
                 .fill(Theme.hairline)
+                .frame(width: axis == .vertical ? 1 : nil, height: axis == .horizontal ? 1 : nil)
                 .overlay(
                     Rectangle()
                         .fill(.clear)
+                        .frame(width: axis == .vertical ? 7 : nil, height: axis == .horizontal ? 7 : nil)
                         .contentShape(Rectangle())
                         .gesture(
                             DragGesture()
