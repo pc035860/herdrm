@@ -52,8 +52,8 @@ All in `Sources/HerdrM` (`AppModel.swift`, `ContentView.swift`,
   once and only ever changes frames.
 - **Scrollback is retained server-side and re-synced on attach** (verified:
   `pane read --source recent` returns full history; a fresh attach draws a
-  full screen including history lines). Re-attach after an accepted remount
-  (takeover recovery) preserves visible content; only lines older than the
+  full screen including history lines). This matters for the surviving
+  re-attach paths (takeover recovery, reconnect overlay): visible content is
   resync window can drop.
 
 ## Design
@@ -139,7 +139,11 @@ path. So the tree never owns views:
 - **Pool**: every split attach is mounted exactly once in a flat
   `ForEach(liveSplitPanes, id: \.paneID)` pool (the kept-alive
   `attachSessions` pattern generalized), plus the agent stack mounted once
-  as today. Pool membership ⟺ pane lifetime: views are added on open and
+  as today. Each pooled terminal reuses the `attachChild` rendering
+  treatment verbatim (solid backdrop inside the opacity compositing group
+  for Ghostty glyph AA, padding, clipping to its rect) — or the depth-1
+  "pixel-identical" gate will fail on rendering artifacts, not geometry.
+  Pool membership ⟺ pane lifetime: views are added on open and
   removed only with their pane's close/death. **A live pane's view is never
   removed, moved, or rebuilt — on split, collapse, re-aim, or resize, at
   any depth.** This is the whole identity strategy, and it has no
@@ -156,7 +160,11 @@ path. So the tree never owns views:
   the two strategies.
 - Because geometry (not structure) carries nesting, same-direction re-split
   of the focused pane is safe: the focused attach keeps its pool position
-  and only shrinks, the new pane mounts fresh. No MVP limitation remains —
+  and only shrinks, the new pane mounts fresh — and, crucially, the new
+  pane's `makeNSView` auto-focuses it (inherited machinery, as today), so
+  focusedSplitLeaf follows focus onto the new leaf and repeated ⌘D drills
+  deeper instead of piling onto one cell. State this focus handoff
+  explicitly: the rapid-⌘D test depends on it. No MVP limitation remains —
   any binary guillotine layout is reachable.
 - Focus dimming generalizes today's `inactivePaneOpacity`: focused leaf
   full opacity, all others dimmed.
@@ -183,10 +191,11 @@ path. So the tree never owns views:
 
 - Split Vertically / Horizontally (⌘D / ⇧⌘D): **always nest under the
   focused pane** in the pressed direction. Uniform rule, no special cases:
-  with the pool strategy every nesting is identity-safe, so the depth-1
-  re-aim behavior (repeat press flips the axis) is intentionally replaced —
-  re-aiming is drag-only from here on. (Behavior change from today, called
-  out explicitly so it isn't mistaken for a regression.)
+  with the pool strategy every nesting is identity-safe. Split orientation
+  is fixed at creation — there is no re-aim (by shortcut or otherwise): to
+  change orientation, close the split pane and re-split (cheap, because
+  panes are ephemeral). This intentionally replaces today's depth-1 repeat
+  behavior, where the opposite-direction press flipped the axis.
 - Focus arrows (⌘⌥ arrows): move keyboard focus to the *neighbor leaf* in
   that direction, computed from tree geometry. Always enabled while a tree
   exists; the 8-item per-axis workaround goes away — items no longer encode
@@ -209,9 +218,8 @@ path. So the tree never owns views:
   verified semantics of the existing single split.
 - No new RPCs. `focus: false` on creation everywhere, as today.
 - Divider ratios stay local (not propagated to the server). The two views
-  agree on split structure — except after a local re-aim, which flips only
-  herdrm's axis while the server keeps the original direction. Full
-  ratio/direction sync is a separate, explicitly deferred decision.
+  agree on split structure, unconditionally. Full ratio/direction sync is
+  a separate, explicitly deferred decision.
 
 ## Migration steps
 
@@ -252,8 +260,12 @@ work can land incrementally if preferred.
       splits).
 - [ ] ⌘W on each pane closes that pane (+focuses nearest survivor); ⌘W on
       the agent collapses all and closes every descendant pane server-side.
-- [ ] Repeat-press semantics: ⌘D always nests under focus; divider re-aim
-      is drag-only.
+- [ ] Repeat-press semantics: ⌘D always nests under focus (each new pane
+      auto-focuses, so repeats drill deeper); no shortcut re-aims —
+      orientation is fixed at split time, close + re-split to change it.
+- [ ] Divider drag adjusts ratios without disturbing attaches; clicking a
+      mouse-reporting pane adjacent to a divider still reaches the TUI
+      (overlay hit-strip tradeoff, same as today).
 - [ ] Rapid ⌘D⌘D / close-mid-open (including across two leaves): no orphaned
       server panes (`herdr pane list` before/after), no killed survivors
       (`herdr pane get` on every surviving paneID).
