@@ -96,8 +96,11 @@ indirect enum SplitNode: Equatable {
 - `openSplit(axis:)` targets the *focused leaf's* herdr pane (agent leaf →
   selected entry's pane; terminal leaf → its pane, resolved via
   `terminalEntries(for:)` for cwd) and replaces that leaf with
-  `split(axis, ratio: 0.5, first: <old leaf>, second: <new terminal>)`.
-  The new pane always goes second (right/bottom), matching today.
+  `split(axis, ratio: <seed>, first: <old leaf>, second: <new terminal>)`,
+  where `<seed>` is the persisted `splitRatio` when creating the root (tree
+  was nil — the user's dragged position survives, as today) and 0.5 for
+  deeper nodes. The new pane always goes second (right/bottom), matching
+  today.
 - Same-device guard: a tree lives in exactly one tab on one device. When a
   tree exists and the focused leaf is `.agent`, splitting requires
   `selectedAttachedEntry` to be on the tree's device (the device of any
@@ -105,7 +108,10 @@ indirect enum SplitNode: Equatable {
   no-ops. Without this, switching devices with a tree open and pressing ⌘D
   would nest a foreign device's pane into the tree, breaking structure
   agreement and closing panes across devices on collapse. (Terminal-leaf
-  splits always use the pane's own device and cannot cross.)
+  splits always use the pane's own device and cannot cross.) By induction —
+  the guard keeps the agent leaf on the tree's device, terminal leaves
+  inherit their pane's device — all leaves always share one device, which is
+  what makes "the tree's device" well-defined.
 - Mid-flight guards, adapted per leaf (not reused verbatim):
   - In-flight tasks are keyed per leaf
     (`splitOpenTasks: [SplitLeafID: Task<Void, Never>]`): repeat ⌘D on a
@@ -273,6 +279,8 @@ work can land incrementally if preferred.
 - [ ] Divider drag adjusts ratios without disturbing attaches; clicking a
       mouse-reporting pane adjacent to a divider still reaches the TUI
       (overlay hit-strip tradeoff, same as today).
+- [ ] Same-device guard: tree open on device D, select an agent on device E,
+      ⌘D → no-op, `herdr pane list` unchanged on both devices.
 - [ ] Rapid ⌘D⌘D / close-mid-open (including across two leaves): no orphaned
       server panes (`herdr pane list` before/after), no killed survivors
       (`herdr pane get` on every surviving paneID).
