@@ -86,6 +86,7 @@ struct SpaceRowDragHost: View {
 
 struct AgentRowDragHost: View {
     let entryID: String
+    var allowsDrag = true
     let onClick: () -> Void
     let onRename: () -> Void
     let onClose: () -> Void
@@ -106,6 +107,7 @@ struct AgentRowDragHost: View {
             ],
             onClick: onClick,
             onDoubleClick: onRename,
+            allowsDrag: allowsDrag,
             onDragStart: onDragStart,
             onDragEnd: onDragEnd,
             onDropHover: onDropHover,
@@ -117,6 +119,7 @@ struct AgentRowDragHost: View {
 
 struct TerminalRowDragHost: View {
     let entryID: String
+    var allowsDrag = true
     let onClick: () -> Void
     let onRename: () -> Void
     let onClose: () -> Void
@@ -137,6 +140,7 @@ struct TerminalRowDragHost: View {
             ],
             onClick: onClick,
             onDoubleClick: onRename,
+            allowsDrag: allowsDrag,
             onDragStart: onDragStart,
             onDragEnd: onDragEnd,
             onDropHover: onDropHover,

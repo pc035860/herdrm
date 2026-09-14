@@ -108,14 +108,14 @@ struct SidebarView: View {
 
                     groupHeader("Agents", expanded: $agentsExpanded)
                     if agentsExpanded {
-                        if model.visibleAgents.isEmpty {
+                        if model.sidebarAgents.isEmpty {
                             Text(emptyAgentsHint)
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(Theme.textGhost)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(8)
                         }
-                        ForEach(model.visibleAgents) { entry in
+                        ForEach(model.sidebarAgents) { entry in
                             AgentRowView(
                                 entry: entry,
                                 model: model,
@@ -125,11 +125,11 @@ struct SidebarView: View {
                         }
                     }
 
-                    if !model.visibleTerminals.isEmpty || !model.shellSessions.isEmpty {
+                    if !model.sidebarTerminals.isEmpty || !model.shellSessions.isEmpty {
                         Spacer().frame(height: 10)
                         groupHeader("Terminals", expanded: $terminalsExpanded)
                         if terminalsExpanded {
-                            ForEach(model.visibleTerminals) { entry in
+                            ForEach(model.sidebarTerminals) { entry in
                                 TerminalRowView(
                                     entry: entry,
                                     model: model,
@@ -261,9 +261,21 @@ struct SidebarView: View {
         @State private var hovered = false
 
         var body: some View {
+            // Phase-1: members are display-only rows — highlight follows
+            // the focused split leaf, clicks focus the column (no attach).
+            let isMember = model.isSplitPane(deviceID: entry.device.id, paneID: entry.pane.paneID)
+            // Single highlight = where the keyboard is. While the split is
+            // showing and a member holds focus, the selection wash on the
+            // owner would double-light the list — col 1 already shows it,
+            // the sidebar needn't repeat it.
             let selected = !model.isFileManagerActive
                 && model.selectedPane == entry.ref
                 && model.selectedShellID == nil
+                && (!model.isSplitActive || model.focusedSplitLeaf == .agent)
+            let memberFocused = isMember && model.isSplitActive
+                && model.selectedShellID == nil && !model.isFileManagerActive
+                && model.isMemberFocused(deviceID: entry.device.id, paneID: entry.pane.paneID)
+            let highlighted = selected || memberFocused
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Image(systemName: "terminal")
@@ -273,6 +285,12 @@ struct SidebarView: View {
                         .font(.system(size: 13.5))
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
+                    if isMember {
+                        Image(systemName: "rectangle.split.2x1")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                            .help("Split member — click focuses its column")
+                    }
                     Spacer(minLength: 0)
                 }
                 HStack(spacing: 5) {
@@ -295,7 +313,7 @@ struct SidebarView: View {
             .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 7)
-                    .fill(selected || hovered ? AnyShapeStyle(Theme.itemWashSelected) : AnyShapeStyle(.clear))
+                    .fill(highlighted || hovered ? AnyShapeStyle(Theme.itemWashSelected) : AnyShapeStyle(.clear))
             )
             .onHover { hovered = $0 }
             .sidebarDragChrome(
@@ -306,7 +324,14 @@ struct SidebarView: View {
             .overlay {
                 TerminalRowDragHost(
                     entryID: entry.id,
-                    onClick: { model.selectAgent(entry.ref) },
+                    allowsDrag: !isMember,
+                    onClick: {
+                        model.selectSidebarEntry(
+                            deviceID: entry.device.id,
+                            paneID: entry.pane.paneID,
+                            ref: entry.ref
+                        )
+                    },
                     onRename: { model.terminalToRename = entry },
                     onClose: { model.requestClosePane(entry.ref, name: entry.title) },
                     onDragStart: { draggingTerminalID = $0 },
@@ -315,6 +340,8 @@ struct SidebarView: View {
                         terminalDrop = nil
                     },
                     onDropHover: { after in
+                        // Members are not reorder targets (phase-1).
+                        guard !isMember else { terminalDrop = nil; return }
                         terminalDrop = sidebarDropTarget(
                             onto: entry.id, after: after, items: model.visibleTerminals
                         )
@@ -325,6 +352,7 @@ struct SidebarView: View {
                     onDrop: { sourceID, after in
                         draggingTerminalID = nil
                         terminalDrop = nil
+                        guard !isMember else { return }
                         guard let source = model.visibleTerminals.first(where: { $0.id == sourceID })
                         else { return }
                         model.moveTerminal(source, onto: entry, placeAfter: after)
@@ -332,7 +360,13 @@ struct SidebarView: View {
                 )
             }
             .accessibilityAddTraits(.isButton)
-            .accessibilityAction { model.selectAgent(entry.ref) }
+            .accessibilityAction {
+                model.selectSidebarEntry(
+                    deviceID: entry.device.id,
+                    paneID: entry.pane.paneID,
+                    ref: entry.ref
+                )
+            }
             .accessibilityLabel(entry.title)
         }
     }
@@ -374,18 +408,37 @@ struct SidebarView: View {
 
     var body: some View {
         let agent = entry.agent
+        // Phase-1: members are display-only rows — see TerminalRowView.
+        let isMember = model.isSplitPane(deviceID: entry.device.id, paneID: agent.paneID)
+        // Same single-highlight rule as TerminalRowView.
         let selected = !model.isFileManagerActive
             && model.selectedPane == entry.ref
             && model.selectedShellID == nil
-        let unread = model.isUnread(entry)
+            && (!model.isSplitActive || model.focusedSplitLeaf == .agent)
+        let memberFocused = isMember && model.isSplitActive
+            && model.selectedShellID == nil && !model.isFileManagerActive
+            && model.isMemberFocused(deviceID: entry.device.id, paneID: agent.paneID)
+        let highlighted = selected || memberFocused
+        // Phase-1 rows carry no status semantics (badges are phase-2):
+        // unread/status stay hidden on members, including VoiceOver.
+        let unread = !isMember && model.isUnread(entry)
+        let a11yLabel = isMember ? entry.title : accessibilityLabel(unread: unread)
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(entry.title)
                     .font(.system(size: 13.5))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
+                if isMember {
+                    Image(systemName: "rectangle.split.2x1")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                        .help("Split member — click focuses its column")
+                }
                 Spacer(minLength: 0)
-                AgentStatusGlyph(status: agent.status, unreadDone: unread)
+                if !isMember {
+                    AgentStatusGlyph(status: agent.status, unreadDone: unread)
+                }
             }
             HStack(spacing: 5) {
                 AgentKindBadge(kind: agent.agent)
@@ -400,7 +453,7 @@ struct SidebarView: View {
                     .foregroundStyle(Theme.textTertiary)
                     .lineLimit(1)
                 Spacer(minLength: 0)
-                if agent.status == .blocked {
+                if agent.status == .blocked, !isMember {
                     Text("needs input")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.warning)
@@ -416,7 +469,7 @@ struct SidebarView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 7)
-                .fill(selected || hovered ? AnyShapeStyle(Theme.itemWashSelected) : AnyShapeStyle(.clear))
+                .fill(highlighted || hovered ? AnyShapeStyle(Theme.itemWashSelected) : AnyShapeStyle(.clear))
         )
         .onHover { hovered = $0 }
         .sidebarDragChrome(
@@ -427,7 +480,14 @@ struct SidebarView: View {
         .overlay {
             AgentRowDragHost(
                 entryID: entry.id,
-                onClick: { model.selectAgent(entry.ref) },
+                allowsDrag: !isMember,
+                onClick: {
+                    model.selectSidebarEntry(
+                        deviceID: entry.device.id,
+                        paneID: agent.paneID,
+                        ref: entry.ref
+                    )
+                },
                 onRename: { model.agentToRename = entry },
                 onClose: { model.requestClosePane(entry.ref, name: entry.title) },
                 onDragStart: { draggingAgentID = $0 },
@@ -436,6 +496,8 @@ struct SidebarView: View {
                     agentDrop = nil
                 },
                     onDropHover: { after in
+                        // Members are not reorder targets (phase-1).
+                        guard !isMember else { agentDrop = nil; return }
                         agentDrop = sidebarDropTarget(
                             onto: entry.id, after: after, items: model.visibleAgents
                         )
@@ -446,6 +508,7 @@ struct SidebarView: View {
                 onDrop: { sourceID, after in
                     draggingAgentID = nil
                     agentDrop = nil
+                    guard !isMember else { return }
                     guard let source = model.visibleAgents.first(where: { $0.id == sourceID })
                     else { return }
                     model.moveAgent(source, onto: entry, placeAfter: after)
@@ -453,8 +516,14 @@ struct SidebarView: View {
             )
         }
         .accessibilityAddTraits(.isButton)
-        .accessibilityAction { model.selectAgent(entry.ref) }
-        .accessibilityLabel(accessibilityLabel(unread: unread))
+        .accessibilityAction {
+            model.selectSidebarEntry(
+                deviceID: entry.device.id,
+                paneID: agent.paneID,
+                ref: entry.ref
+            )
+        }
+        .accessibilityLabel(a11yLabel)
     }
 
     private func accessibilityLabel(unread: Bool) -> String {

@@ -952,15 +952,25 @@ final class AppModel: ObservableObject {
 
     /// Agents across the scope, filtered by selected space, in herdr tab order
     /// (device → workspace → snapshot array) so sidebar drag matches the TUI.
-    var visibleAgents: [AgentEntry] {
+    var visibleAgents: [AgentEntry] { agentEntries(includingSplitMembers: false) }
+
+    /// Phase-1 display list: split members included as focus-only rows
+    /// (clicks route to focusSplitLeaf, never an attach). Attach-path
+    /// consumers (auto-select, drag targets, search) keep reading the
+    /// filtered visibleAgents / visibleTerminals.
+    var sidebarAgents: [AgentEntry] { agentEntries(includingSplitMembers: true) }
+
+    private func agentEntries(includingSplitMembers: Bool) -> [AgentEntry] {
         var entries = devicesInScope.flatMap { device in
             session(device.id).agents.map { agentEntry(device: device, agent: $0) }
         }
         // A split member running an agent CLI is an agent server-side but a
-        // terminal leaf in the tree: selecting it from here would double-
-        // attach it under --takeover (pool + agent stack). Members are
-        // reached by focusing their column, never from the sidebar.
-        entries.removeAll(where: { isSplitPane(deviceID: $0.device.id, paneID: $0.agent.paneID) })
+        // terminal leaf in the tree: attaching it here would double-attach
+        // under --takeover (pool + agent stack) and kick the pool's own.
+        // The sidebar display list keeps members as focus-only rows.
+        if !includingSplitMembers {
+            entries.removeAll(where: { isSplitPane(deviceID: $0.device.id, paneID: $0.agent.paneID) })
+        }
         if let space = selectedSpace {
             entries = entries.filter {
                 $0.device.id == space.deviceID && $0.agent.workspaceID == space.workspaceID
@@ -993,12 +1003,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    var visibleTerminals: [TerminalEntry] {
+    var visibleTerminals: [TerminalEntry] { terminalEntryList(includingSplitMembers: false) }
+
+    /// Phase-1 display list — see sidebarAgents.
+    var sidebarTerminals: [TerminalEntry] { terminalEntryList(includingSplitMembers: true) }
+
+    private func terminalEntryList(includingSplitMembers: Bool) -> [TerminalEntry] {
         var entries = devicesInScope.flatMap { terminalEntries(for: $0) }
-        // The ephemeral split pane is a real tab while open; keep it out of
-        // the sidebar (and drag targets, and auto-selection below) so it can
-        // never be double-attached — see isSplitPane.
-        entries.removeAll(where: { isSplitPane($0) })
+        // Same double-attach rule as agentEntries: the filtered list feeds
+        // drag targets and auto-selection; the sidebar list keeps members
+        // as focus-only rows.
+        if !includingSplitMembers {
+            entries.removeAll(where: { isSplitPane($0) })
+        }
         if let space = selectedSpace {
             entries = entries.filter {
                 $0.device.id == space.deviceID && $0.pane.workspaceID == space.workspaceID
@@ -1178,6 +1195,78 @@ final class AppModel: ObservableObject {
         isFileManagerActive = false
         selectedPane = ref
         selectedShellID = nil
+    }
+
+    /// Sidebar click router (phase-1: display/attach split). A split member
+    /// row focuses its column and touches no attach — the pool owns it, and
+    /// a second --takeover would kick it. Free rows keep take-over-on-click
+    /// via selectAgent, plus an explicit focus handoff (the kept-alive agent
+    /// leaf never self-focuses, so a bare selection change can leave the
+    /// keyboard behind in the split).
+    func selectSidebarEntry(deviceID: UUID, paneID: String, ref: PaneRef) {
+        // Any sidebar row click leaves shells and the file manager behind
+        // (selectAgent repeats this for free rows below — harmless).
+        isFileManagerActive = false
+        selectedShellID = nil
+        if isSplitPane(deviceID: deviceID, paneID: paneID) {
+            focusMemberPane(deviceID: deviceID, paneID: paneID)
+            return
+        }
+        selectAgent(ref)
+        // Same handoff as the entry.id change handler in ContentView: the
+        // click may not move selection at all (re-clicking the shown agent),
+        // and only an explicit focus moves the keyboard to the agent leaf.
+        // Claim the leaf only when focus actually lands; a failed focus
+        // must not poison highlight or split-command routing.
+        if isSplitActive, let selection = selectedAttachedEntry,
+           let leaf = splitLeaf(matching: selection.ref),
+           focusSplitLeaf(leaf) {
+            focusedSplitLeaf = leaf
+        }
+    }
+
+    /// Member click. While suspended (tree live, selection on a foreign tab)
+    /// a bare focus is a deliberate no-op, so re-show the tree first by
+    /// selecting its owner — the manual "click A, then B works" workaround,
+    /// automated. Pre-seeds focusedSplitLeaf so the isSplitActive resume
+    /// handoff already aims at the member; the async re-assert covers the
+    /// unhide render winning the race.
+    private func focusMemberPane(deviceID: UUID, paneID: String) {
+        let leaf = SplitLeafID.pane(deviceID: deviceID, paneID: paneID)
+        if splitTree != nil, !isSplitActive,
+           let device = treeDevice(), let owner = splitTreeOwner {
+            let ownerRef = PaneRef(deviceID: device.id, paneID: owner.paneID)
+            // Pre-seed so the isSplitActive resume handoff already aims at
+            // the member; the async block below verifies and rolls back.
+            let prior = focusedSplitLeaf
+            focusedSplitLeaf = leaf
+            selectAgent(ownerRef)
+            // The selection handoff above re-aims focusedSplitLeaf at the
+            // owner (agent leaf) as part of this same unsuspend — not the
+            // user moving on — so guard on the selection, not the leaf.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isSplitActive,
+                      self.selectedAttachedEntry?.ref == ownerRef else { return }
+                if self.focusSplitLeaf(leaf) {
+                    self.focusedSplitLeaf = leaf
+                } else {
+                    // Tree back but focus didn't land: don't claim it.
+                    self.focusedSplitLeaf = prior
+                }
+            }
+            return
+        }
+        // Active tree: claim the leaf only when focus actually lands, so a
+        // failed focus can't poison highlight or split-command routing.
+        if focusSplitLeaf(leaf) {
+            focusedSplitLeaf = leaf
+        }
+    }
+
+    /// Phase-1 sidebar highlight for member rows: selection never lands on
+    /// members, so their highlight follows the focused split leaf instead.
+    func isMemberFocused(deviceID: UUID, paneID: String) -> Bool {
+        focusedSplitLeaf == .pane(deviceID: deviceID, paneID: paneID)
     }
 
     var selectedShell: ShellSession? {
@@ -1659,13 +1748,17 @@ final class AppModel: ObservableObject {
     /// can't take focus, and guessing another pane's view would land the
     /// keyboard in the wrong place. The tracker's KVO report is the source of
     /// truth for `focusedSplitLeaf`; this only moves the responder.
-    func focusSplitLeaf(_ id: SplitLeafID) {
+    /// Returns whether the responder actually moved (callers gate their
+    /// `focusedSplitLeaf` claims on this — a failed focus must not poison
+    /// highlight or split-command routing).
+    @discardableResult
+    func focusSplitLeaf(_ id: SplitLeafID) -> Bool {
         // Never land the keyboard in a suspended (hidden) tree.
-        guard isSplitActive else { return }
+        guard isSplitActive else { return false }
         let view: NSView? = SplitLeafViewRegistry.view(for: id)
             ?? (id == .agent ? splitAgentView : nil)
-        guard let view, let window = view.window else { return }
-        window.makeFirstResponder(view)
+        guard let view, let window = view.window else { return false }
+        return window.makeFirstResponder(view)
     }
 
     /// Reads the ratio of the split node at `path` (child indices from root).
