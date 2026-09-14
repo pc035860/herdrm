@@ -383,6 +383,22 @@ public actor HerdrService {
         _ = try await client().request(method: "workspace.move_block", params: .object(params))
     }
 
+    /// Splits a pane (`pane.split`) and returns the new sibling pane id. The new
+    /// pane lives in the SAME tab — unlike `createTab`, which opens a whole new
+    /// tab.
+    public func splitPane(paneID: String, direction: PaneSplitDirection, cwd: String?) async throws -> String {
+        var params: [String: JSONValue] = [
+            "direction": .string(direction.rawValue),
+            "target_pane_id": .string(paneID),
+            "focus": .bool(false),
+        ]
+        if let cwd { params["cwd"] = .string(cwd) }
+        let result = try await client().request(method: "pane.split", params: .object(params))
+        guard let newPaneID = result["pane"]?["pane_id"]?.stringValue
+        else { throw HerdrError.malformedResponse("pane.split returned no pane.pane_id") }
+        return newPaneID
+    }
+
     /// Creates a tab (optionally in a workspace/cwd) and returns the new pane id.
     public func createTab(workspaceID: String?, cwd: String?, label: String?) async throws -> String {
         var params: [String: JSONValue] = ["focus": .bool(false)]

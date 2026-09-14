@@ -160,9 +160,10 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    /// The herdr pane behind the ⌘D split: a real server-side terminal tab in
-    /// the selected entry's workspace — beside the agent, on the same device —
-    /// not a local shell. Ephemeral by design: closing the split closes the pane.
+    /// The herdr pane behind the ⌘D split: a real server-side sibling pane in
+    /// the same tab — beside the agent, on the same device — not a local shell
+    /// and not a separate tab. Ephemeral by design: closing the split closes
+    /// the pane.
     struct SplitTerminal: Equatable {
         let device: Device
         let paneID: String
@@ -170,11 +171,11 @@ final class AppModel: ObservableObject {
     }
     @Published var splitTerminal: SplitTerminal?
     /// Pane IDs concealed from the sidebar, search, and auto-selection while
-    /// the split owns them. Inserted right after `createTab` (before the first
-    /// refresh can publish the new tab) and removed once `splitTerminal` takes
+    /// the split owns them. Inserted right after `pane.split` (before the first
+    /// refresh can publish the new pane) and removed once `splitTerminal` takes
     /// over or the pane is cleaned up — so the ephemeral pane never renders a
     /// selectable row anywhere. Best-effort for one hop only: an event-driven
-    /// refresh landing between `createTab` and conceal still flashes it for a
+    /// refresh landing between `pane.split` and conceal still flashes it for a
     /// frame, then it self-heals on the next render.
     private var concealedSplitPaneIDs = Set<String>()
     /// The in-flight `openSplit` task, if any. Repeat ⌘D presses while the tab
@@ -670,7 +671,7 @@ final class AppModel: ObservableObject {
 
     // MARK: - Split terminal (⌘D)
 
-    /// Opens the split with a herdr pane in the selected entry's workspace.
+    /// Opens the split as a sibling herdr pane beside the selected entry.
     /// Re-pressing with the split open only re-aims the divider, keeping the
     /// same pane — matching what re-setting the axis did for the old shell.
     func openSplit(axis: SplitAxis) {
@@ -680,8 +681,11 @@ final class AppModel: ObservableObject {
         }
         guard splitOpenTask == nil, let entry = selectedAttachedEntry else { return }
         let device = entry.device
-        let workspaceID = entry.workspaceID
         let entryID = entry.id
+        let targetPaneID = entry.ref.paneID
+        // herdrm's vertical split (side by side) is herdr's "right"; the
+        // horizontal split (stacked) is herdr's "down".
+        let direction: PaneSplitDirection = axis == .vertical ? .right : .down
         // Start beside the agent: same working directory, so the split is
         // continuous with whatever it was split from.
         let cwd: String? = switch entry {
@@ -695,10 +699,12 @@ final class AppModel: ObservableObject {
             defer { if !Task.isCancelled { splitOpenTask = nil } }
             let paneID: String
             do {
-                paneID = try await service(for: device).createTab(
-                    workspaceID: workspaceID,
-                    cwd: cwd,
-                    label: nil
+                // A true sibling split in the SAME tab (not a new tab): the
+                // herdr TUI sees the same side-by-side layout herdrm shows.
+                paneID = try await service(for: device).splitPane(
+                    paneID: targetPaneID,
+                    direction: direction,
+                    cwd: cwd
                 )
             } catch {
                 actionError = actionErrorMessage(error, device: device)
@@ -707,7 +713,7 @@ final class AppModel: ObservableObject {
             let concealKey = Self.splitPaneKey(deviceID: device.id, paneID: paneID)
             concealedSplitPaneIDs.insert(concealKey)
             defer { concealedSplitPaneIDs.remove(concealKey) }
-            // The new tab may miss a coalesced refresh; retry boundedly before
+            // The new pane may miss a coalesced refresh; retry boundedly before
             // giving up, so a transient snapshot gap doesn't silently eat ⌘D.
             var terminal: TerminalEntry?
             for _ in 0..<3 {
