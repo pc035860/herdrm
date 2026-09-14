@@ -122,7 +122,8 @@ final class AppModel: ObservableObject {
             // Switching back to the split owner after a relaunch adopts the
             // still-live panes (the server-focus fallback may have landed
             // elsewhere; the refresh path below covers the first arrival).
-            restoreSplitTreeIfNeeded()
+            // No selection normalize here: a click is intent, never yank it.
+            restoreSplitTreeIfNeeded(normalizeSelection: false)
         }
     }
 
@@ -364,7 +365,7 @@ final class AppModel: ObservableObject {
     private lazy var pendingSplitSnapshot: PersistedSplitSnapshot? = {
         guard let data = UserDefaults.standard.data(forKey: Self.splitTreeSnapshotKey),
               let snapshot = try? JSONDecoder().decode(PersistedSplitSnapshot.self, from: data),
-              snapshot.version == PersistedSplitSnapshot.currentVersion
+              snapshot.version <= PersistedSplitSnapshot.currentVersion
         else { return nil }
         return snapshot
     }()
@@ -374,8 +375,17 @@ final class AppModel: ObservableObject {
     /// referenced by server pane ID and re-resolved against live
     /// `terminalEntries` on restore — never trusted blindly, so panes closed
     /// while the app was away prune out instead of pointing at ghosts.
+    /// v2 adds the quit-time selection: the agent leaf renders the *selected*
+    /// entry, so restoring the tree without the selection shows the splits
+    /// over the wrong agent ("agent pinned to col1" surprise). v1 snapshots
+    /// migrate with selection = owner.
     private struct PersistedSplitSnapshot: Codable {
-        static let currentVersion = 1
+        static let currentVersion = 2
+        struct SelectedRef: Codable {
+            var deviceID: UUID
+            var paneID: String
+            var isAgent: Bool
+        }
         var version: Int
         var deviceID: UUID
         var ownerPaneID: String
@@ -383,11 +393,61 @@ final class AppModel: ObservableObject {
         /// Focused terminal pane at snapshot time; nil = agent leaf.
         var focusedPaneID: String?
         var root: PersistedSplitNode
+        /// The entry selected at snapshot time (the quit view). Usually the
+        /// owner, but the user may have been viewing elsewhere with the tree
+        /// open (the agent leaf follows selection).
+        var selected: SelectedRef
+
+        private enum Keys: String, CodingKey {
+            case version, deviceID, ownerPaneID, ownerIsAgent, focusedPaneID, root, selected
+        }
+
+        init(version: Int, deviceID: UUID, ownerPaneID: String, ownerIsAgent: Bool, focusedPaneID: String?, root: PersistedSplitNode, selected: SelectedRef) {
+            self.version = version
+            self.deviceID = deviceID
+            self.ownerPaneID = ownerPaneID
+            self.ownerIsAgent = ownerIsAgent
+            self.focusedPaneID = focusedPaneID
+            self.root = root
+            self.selected = selected
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: Keys.self)
+            version = try container.decode(Int.self, forKey: .version)
+            deviceID = try container.decode(UUID.self, forKey: .deviceID)
+            ownerPaneID = try container.decode(String.self, forKey: .ownerPaneID)
+            ownerIsAgent = try container.decode(Bool.self, forKey: .ownerIsAgent)
+            focusedPaneID = try container.decodeIfPresent(String.self, forKey: .focusedPaneID)
+            root = try container.decode(PersistedSplitNode.self, forKey: .root)
+            selected = try container.decodeIfPresent(SelectedRef.self, forKey: .selected)
+                ?? SelectedRef(deviceID: deviceID, paneID: ownerPaneID, isAgent: ownerIsAgent)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: Keys.self)
+            try container.encode(Self.currentVersion, forKey: .version)
+            try container.encode(deviceID, forKey: .deviceID)
+            try container.encode(ownerPaneID, forKey: .ownerPaneID)
+            try container.encode(ownerIsAgent, forKey: .ownerIsAgent)
+            try container.encodeIfPresent(focusedPaneID, forKey: .focusedPaneID)
+            try container.encode(root, forKey: .root)
+            try container.encode(selected, forKey: .selected)
+        }
 
         /// Must equal `AttachedEntry.id` for the owner ("agent-<uuid>-<pane>"
         /// / "terminal-<uuid>-<pane>") — the restore gate compares this.
         var ownerEntryID: String {
-            "\(ownerIsAgent ? "agent" : "terminal")-\(deviceID.uuidString)-\(ownerPaneID)"
+            Self.entryID(deviceID: deviceID, paneID: ownerPaneID, isAgent: ownerIsAgent)
+        }
+        /// Same shape for the quit-time selection.
+        var selectedEntryID: String {
+            Self.entryID(deviceID: selected.deviceID, paneID: selected.paneID, isAgent: selected.isAgent)
+        }
+        var selectedRef: PaneRef { PaneRef(deviceID: selected.deviceID, paneID: selected.paneID) }
+        var ownerRef: PaneRef { PaneRef(deviceID: deviceID, paneID: ownerPaneID) }
+        private static func entryID(deviceID: UUID, paneID: String, isAgent: Bool) -> String {
+            "\(isAgent ? "agent" : "terminal")-\(deviceID.uuidString)-\(paneID)"
         }
         /// Every terminal pane the snapshot references, for the "quit while
         /// typing in a split pane" gate (selection may be a snapshot pane,
@@ -490,7 +550,22 @@ final class AppModel: ObservableObject {
             ownerPaneID: owner.paneID,
             ownerIsAgent: owner.isAgent,
             focusedPaneID: focusedPaneID,
-            root: persistedNode(tree)
+            root: persistedNode(tree),
+            selected: {
+                // The quit view: whoever is selected now (often the owner,
+                // but the agent leaf follows selection, so it may be a
+                // foreign entry with the tree open). Falls back to the
+                // previous snapshot's selection, then the owner.
+                switch selectedAttachedEntry {
+                case .agent(let entry):
+                    return PersistedSplitSnapshot.SelectedRef(deviceID: entry.device.id, paneID: entry.agent.paneID, isAgent: true)
+                case .terminal(let entry):
+                    return PersistedSplitSnapshot.SelectedRef(deviceID: entry.device.id, paneID: entry.pane.paneID, isAgent: false)
+                case nil:
+                    return pendingSplitSnapshot?.selected
+                        ?? PersistedSplitSnapshot.SelectedRef(deviceID: device.id, paneID: owner.paneID, isAgent: owner.isAgent)
+                }
+            }()
         )
         pendingSplitSnapshot = snapshot
         if let data = try? JSONEncoder().encode(snapshot) {
@@ -498,26 +573,41 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Live pane IDs for a device, or nil if it has no successful snapshot
+    /// yet — "gone" is indistinguishable from "not loaded", so callers
+    /// treat nil as unknown and defer instead of pruning.
+    private func livePaneIDs(for deviceID: UUID) -> Set<String>? {
+        guard previousStatuses[deviceID] != nil else { return nil }
+        let state = session(deviceID)
+        return Set(state.agents.map(\.paneID)).union(state.panes.map(\.paneID))
+    }
+
     /// Re-adopts still-live split panes after a relaunch. Runs on every
     /// successful device refresh while treeless with a snapshot pending, and
-    /// on selection change (covers switching back to the owner after the
+    /// on selection change (covers switching back to the family after the
     /// server-focus fallback landed elsewhere). Missing panes prune out via
     /// promotion (same shape as `pruneTerminalLeaf`); a snapshot with
     /// nothing alive clears itself so later refreshes stop retrying. Setting
     /// the tree re-persists the validated shape — the snapshot self-heals.
-    private func restoreSplitTreeIfNeeded() {
+    ///
+    /// With `normalizeSelection` (the refresh path), selection returns to the
+    /// quit view when it (else the owner) is still alive — the agent leaf
+    /// renders the selection, so the tree alone doesn't reproduce what the
+    /// user saw. The didSet path passes false: a user click is intent, never
+    /// yank it. Either way a selection stranded on an adopted split pane
+    /// hands back to the (live) owner — selecting a split pane would
+    /// double-attach it (agent stack + pool take over each other).
+    private func restoreSplitTreeIfNeeded(normalizeSelection: Bool) {
         guard splitTree == nil,
               let snapshot = pendingSplitSnapshot,
               let device = device(snapshot.deviceID)
         else { return }
-        // Owner, or a snapshot pane (quit-while-typing lands server focus on
-        // the split pane, not the owner). Anything else: not our context —
-        // keep the snapshot for a later switch-back.
-        guard let selection = selectedAttachedEntry,
-              selection.device.id == snapshot.deviceID,
-              selection.id == snapshot.ownerEntryID
-                  || snapshot.terminalPaneIDs.contains(selection.ref.paneID)
-        else { return }
+        // Inside the family (owner / quit-selection / snapshot panes):
+        // anything else means the user's context moved on — wait for
+        // switch-back instead of yanking them into our tab.
+        var family = Set([snapshot.ownerEntryID, snapshot.selectedEntryID])
+        family.formUnion(snapshot.terminalPaneIDs.map { "terminal-\(snapshot.deviceID.uuidString)-\($0)" })
+        guard let selection = selectedAttachedEntry, family.contains(selection.id) else { return }
         func build(_ node: PersistedSplitNode) -> SplitNode? {
             switch node {
             case .agent:
@@ -541,6 +631,19 @@ final class AppModel: ObservableObject {
             return
         }
         pendingSplitSnapshot = nil
+        // Selection first, so the persist inside updateSplitTree captures the
+        // post-restore selection (and the didSet reentry exits on nil pending).
+        let ownerAlive = livePaneIDs(for: snapshot.deviceID)?.contains(snapshot.ownerPaneID) == true
+        if normalizeSelection {
+            let selected = snapshot.selected
+            let selectedAlive = livePaneIDs(for: selected.deviceID)?.contains(selected.paneID)
+            if selectedAlive == true, !snapshot.terminalPaneIDs.contains(selected.paneID) {
+                if selectedPane != snapshot.selectedRef { selectedPane = snapshot.selectedRef }
+            } else if selectedAlive == false, ownerAlive {
+                if selectedPane != snapshot.ownerRef { selectedPane = snapshot.ownerRef }
+            }
+            // Unknown (selected device not loaded yet): leave selection alone.
+        }
         updateSplitTree { $0 = restored }
         if let paneID = snapshot.focusedPaneID,
            treeContainsPane(deviceID: snapshot.deviceID, paneID: paneID) {
@@ -548,13 +651,12 @@ final class AppModel: ObservableObject {
         } else {
             focusedSplitLeaf = .agent
         }
-        // The server-focus fallback above may have landed the selection on a
+        // The server-focus fallback may have landed the selection on a
         // now-adopted split pane (tree was nil, so nothing concealed it).
-        // Hand selection back to the owner — selecting a split pane would
-        // double-attach it (agent stack + pool take over each other).
-        if let selected = selectedPane,
+        if ownerAlive,
+           let selected = selectedPane,
            isSplitPane(deviceID: selected.deviceID, paneID: selected.paneID) {
-            selectedPane = PaneRef(deviceID: snapshot.deviceID, paneID: snapshot.ownerPaneID)
+            selectedPane = snapshot.ownerRef
         }
     }
 
@@ -1932,9 +2034,10 @@ final class AppModel: ObservableObject {
                 }
             }
             // Adopt still-live split panes after a relaunch (validates against
-            // the snapshot above, prunes the dead, hands selection back to
-            // the owner if the fallback landed on a split pane).
-            restoreSplitTreeIfNeeded()
+            // the snapshot above, prunes the dead, returns selection to the
+            // quit view when alive, hands a split-pane landing back to the
+            // owner).
+            restoreSplitTreeIfNeeded(normalizeSelection: true)
             return true
         } catch {
             // A snapshot is one request on an otherwise live session. The
