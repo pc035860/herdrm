@@ -33,21 +33,12 @@ private struct AppModelFocusedValueKey: FocusedValueKey {
 /// gets the AppModel by reference and never subscribes to its objectWillChange, so
 /// `focusedModel?.shellSplitAxis` was evaluated once and stuck: the menu items stayed
 /// disabled with a split open, and a disabled NSMenuItem does not fire its key
-/// equivalent. A value type changes identity, which does invalidate the commands body —
-/// that is also what lets the shortcuts follow the current axis.
-private struct SplitAxisFocusedValueKey: FocusedValueKey {
-    typealias Value = SplitAxis
-}
-
+/// Commands read the model straight through `focusedModel`, so no other
+/// focused values are needed.
 extension FocusedValues {
     var appModel: AppModel? {
         get { self[AppModelFocusedValueKey.self] }
         set { self[AppModelFocusedValueKey.self] = newValue }
-    }
-
-    var splitAxis: SplitAxis? {
-        get { self[SplitAxisFocusedValueKey.self] }
-        set { self[SplitAxisFocusedValueKey.self] = newValue }
     }
 }
 
@@ -56,7 +47,6 @@ struct HerdrMApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage("app.theme") private var themePreference = "system"
     @FocusedValue(\.appModel) private var focusedModel
-    @FocusedValue(\.splitAxis) private var focusedSplitAxis
 
     private let updaterController: SPUStandardUpdaterController
 
@@ -106,80 +96,86 @@ struct HerdrMApp: App {
             }
 
             CommandMenu("Terminal") {
-                // Guarded on selectedAttachedEntry, not just on the model: with the placeholder
-                // on screen there is no SplitContainer to render into, so a split would
-                // be invisible yet leave shellSplitAxis non-nil — and the next ⌘W would
-                // "close" that phantom instead of the window.
+                // Enabled whenever a tree or a selected entry exists: with the
+                // placeholder on screen and no tree, a split would be invisible
+                // yet arm state the next ⌘W would "close" instead of the window.
                 Button("Split Vertically") { focusedModel?.openSplit(axis: .vertical) }
                     .keyboardShortcut("d", modifiers: .command)
-                    .disabled(focusedModel?.selectedAttachedEntry == nil)
+                    .disabled(focusedModel?.splitTree == nil && focusedModel?.selectedAttachedEntry == nil)
                 Button("Split Horizontally") { focusedModel?.openSplit(axis: .horizontal) }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
-                    .disabled(focusedModel?.selectedAttachedEntry == nil)
+                    .disabled(focusedModel?.splitTree == nil && focusedModel?.selectedAttachedEntry == nil)
 
                 Divider()
 
-                // Eight items with FIXED shortcuts, enabled per axis — deliberately not
-                // four items whose shortcut follows the axis. Measured: `.disabled` IS
-                // revalidated when the menu opens, but a key equivalent already registered
-                // in the NSMenu is NOT reassigned when the commands body re-evaluates, so
-                // the arrows stayed frozen on the axis that was current at launch.
-                // Labels name the direction so no two rows read the same.
-                //
-                // Focus is directional and idempotent: the left/top pane is always the
-                // agent, the right/bottom one always the shell.
+                // Four directional items with FIXED shortcuts, enabled while any
+                // tree exists — deliberately not axis-gated. The old eight-item
+                // workaround existed because shortcuts froze on the axis current
+                // at launch; items no longer encode the axis, so that staleness
+                // class can't recur. The neighbor comes from tree structure, and
+                // a missing neighbor (layout edge) is a safe no-op — never gate
+                // correctness on `.disabled()` revalidation (the ⌘D lesson).
                 Button("Focus Left Pane") {
-                    if let model = focusedModel { focusSplitSide(.agent, in: model) }
+                    focusedModel?.focusNeighbor(.left)
                 }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
-                .disabled(focusedSplitAxis != .vertical)
+                .disabled(focusedModel?.splitTree == nil)
                 Button("Focus Right Pane") {
-                    if let model = focusedModel { focusSplitSide(.shell, in: model) }
+                    focusedModel?.focusNeighbor(.right)
                 }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
-                .disabled(focusedSplitAxis != .vertical)
+                .disabled(focusedModel?.splitTree == nil)
                 Button("Focus Top Pane") {
-                    if let model = focusedModel { focusSplitSide(.agent, in: model) }
+                    focusedModel?.focusNeighbor(.up)
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
-                .disabled(focusedSplitAxis != .horizontal)
+                .disabled(focusedModel?.splitTree == nil)
                 Button("Focus Bottom Pane") {
-                    if let model = focusedModel { focusSplitSide(.shell, in: model) }
+                    focusedModel?.focusNeighbor(.down)
                 }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
-                .disabled(focusedSplitAxis != .horizontal)
+                .disabled(focusedModel?.splitTree == nil)
 
                 Divider()
 
-                // Resize moves the divider by 5% relative to the active pane.
+                // Resize nudges the focused leaf's nearest same-direction divider
+                // by 5% toward the pressed arrow; a leaf facing the other axis
+                // no-ops (same ⌘D-lesson rule as focus above).
                 Button("Widen Active Pane") {
-                    if let model = focusedModel { resizeSplit(grow: true, in: model) }
+                    focusedModel?.nudgeFocusedLeaf(arrow: .right)
                 }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .control])
-                .disabled(focusedSplitAxis != .vertical)
+                .disabled(focusedModel?.splitTree == nil)
                 Button("Narrow Active Pane") {
-                    if let model = focusedModel { resizeSplit(grow: false, in: model) }
+                    focusedModel?.nudgeFocusedLeaf(arrow: .left)
                 }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .control])
-                .disabled(focusedSplitAxis != .vertical)
+                .disabled(focusedModel?.splitTree == nil)
                 Button("Grow Active Pane") {
-                    if let model = focusedModel { resizeSplit(grow: true, in: model) }
+                    focusedModel?.nudgeFocusedLeaf(arrow: .down)
                 }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .control])
-                .disabled(focusedSplitAxis != .horizontal)
+                .disabled(focusedModel?.splitTree == nil)
                 Button("Shrink Active Pane") {
-                    if let model = focusedModel { resizeSplit(grow: false, in: model) }
+                    focusedModel?.nudgeFocusedLeaf(arrow: .up)
                 }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .control])
-                .disabled(focusedSplitAxis != .horizontal)
+                .disabled(focusedModel?.splitTree == nil)
             }
             CommandGroup(replacing: .saveItem) {
-                // ⌘W closes the most local thing first: the split, then the
-                // selected standalone terminal, then the window. Server-owned
-                // panes close from their confirmed sidebar action instead.
+                // ⌘W closes the most local thing first: the focused split pane,
+                // then the selected standalone terminal, then the window.
+                // Server-owned panes close from their confirmed sidebar action
+                // instead. Closing the agent leaf collapses the whole tree.
                 Button(closeButtonTitle) {
-                    if let model = focusedModel, model.shellSplitAxis != nil {
-                        model.shellSplitAxis = nil
+                    if let model = focusedModel, model.splitTree != nil {
+                        switch model.focusedSplitLeaf {
+                        case .pane(let deviceID, let paneID):
+                            model.closeSplitLeaf(.pane(deviceID: deviceID, paneID: paneID))
+                            model.focusSplitLeaf(model.focusedSplitLeaf)
+                        case .agent:
+                            model.shellSplitAxis = nil
+                        }
                     } else if let model = focusedModel, let shell = model.selectedShell {
                         model.closeShellSession(shell.id)
                     } else {
@@ -196,7 +192,7 @@ struct HerdrMApp: App {
     }
 
     private var closeButtonTitle: String {
-        if focusedModel?.shellSplitAxis != nil { return String(localized: "Close Split") }
+        if focusedModel?.splitTree != nil { return String(localized: "Close Split Pane") }
         if focusedModel?.selectedShell != nil { return String(localized: "Close Terminal") }
         return String(localized: "Close")
     }
@@ -210,21 +206,6 @@ struct HerdrMApp: App {
     }
 
     // MARK: - Split commands
-
-    private func focusSplitSide(_ side: SplitSide, in model: AppModel) {
-        guard model.shellSplitAxis != nil else { return }
-        let target = (side == .agent) ? model.splitAgentView : model.splitShellView
-        guard let target, let window = target.window else { return }
-        window.makeFirstResponder(target)
-    }
-
-    private func resizeSplit(grow: Bool, in model: AppModel) {
-        guard model.shellSplitAxis != nil else { return }
-        let step = 0.05
-        let signed = (model.activeSplitSide == .agent) ? step : -step
-        let delta = grow ? signed : -signed
-        model.splitRatio = min(0.8, max(0.2, model.splitRatio + delta))
-    }
 
     private static func runSSHAskPass() -> Never {
         let environment = ProcessInfo.processInfo.environment

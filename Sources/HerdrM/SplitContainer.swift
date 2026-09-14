@@ -104,29 +104,29 @@ struct SplitContainer<First: View, Second: View>: View {
 /// transitions through nil — so the observer reinstalls itself when the key window
 /// changes. Treat that half as a measured, non-contractual dependency on AppKit.
 ///
-/// This class holds no copy of the active side on purpose: it reports every computed
-/// value to `onSideChanged` without deduplicating. A cached side here went stale when
+/// This class holds no copy of the focused leaf on purpose: it reports every computed
+/// value to `onLeafChanged` without deduplicating. A cached leaf here went stale when
 /// the split closed and then silently stopped reporting, which drew the active pane
 /// dimmed and inverted the resize direction.
 ///
 /// AppKit changes `firstResponder` and `keyWindow` on the main thread, so the callback
 /// is delivered there too.
 final class SplitFocusTracker {
-    /// Called with the side that now holds the keyboard. Fires on every observed
+    /// Called with the leaf that now holds the keyboard. Fires on every observed
     /// change, even when the value repeats — see the note above.
-    var onSideChanged: ((SplitSide) -> Void)?
+    var onLeafChanged: ((AppModel.SplitLeafID) -> Void)?
 
-    /// Reports whether a view belongs to the agent side. Backed by the attach
-    /// registry's live views: kept-alive attaches persist across selection switches,
-    /// and only the selected one is visible/focusable, so a responder inside any of
-    /// them means the agent side holds the keyboard. A single stored agent view would
-    /// go stale the moment the selection switched while the old view was still first
-    /// responder — the exact staleness the class comment above warns against.
-    var isAgentView: (NSView) -> Bool = { _ in false }
-    weak var shellView: LineBreakTerminalView?
+    /// Maps a first responder to the leaf whose view contains it. Supplied by the
+    /// view layer: attach-registry hit → `.agent`, else the nearest registered
+    /// leaf view ancestor, else nil (responder outside any pane — keeps the last
+    /// report, same as the old side tracker). A single stored agent view would
+    /// go stale the moment the selection switched while the old view was still
+    /// first responder — the exact staleness the class comment above warns against.
+    var resolveLeaf: ((NSView) -> AppModel.SplitLeafID?)?
 
     private var keyWindowObservation: NSKeyValueObservation?
     private var firstResponderObservation: NSKeyValueObservation?
+    private var reportedLeaf: AppModel.SplitLeafID?
 
     func start() {
         keyWindowObservation = NSApp.observe(\.keyWindow, options: [.new]) { [weak self] _, _ in
@@ -141,19 +141,18 @@ final class SplitFocusTracker {
             \.firstResponder,
             options: [.new]
         ) { [weak self] _, _ in
-            self?.updateActiveSide()
+            self?.updateFocusedLeaf()
         }
-        updateActiveSide()
+        updateFocusedLeaf()
     }
 
-    private func updateActiveSide() {
-        guard let responder = NSApp.keyWindow?.firstResponder as? NSView else { return }
-        var view: NSView? = responder
-        while let current = view {
-            if isAgentView(current) { onSideChanged?(.agent); return }
-            if current === shellView { onSideChanged?(.shell); return }
-            view = current.superview
-        }
+    private func updateFocusedLeaf() {
+        guard let responder = NSApp.keyWindow?.firstResponder as? NSView,
+              let leaf = resolveLeaf?(responder),
+              leaf != reportedLeaf
+        else { return }
+        reportedLeaf = leaf
+        onLeafChanged?(leaf)
     }
 
     deinit {

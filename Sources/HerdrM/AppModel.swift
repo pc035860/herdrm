@@ -896,45 +896,122 @@ final class AppModel: ObservableObject {
     /// Prunes one terminal leaf: collapses its parent to the surviving sibling
     /// and closes the leaf's pane. Agent-leaf close goes through the
     /// `shellSplitAxis = nil` funnel (whole-tree collapse above), not here.
+    /// Focus follows the nearest surviving leaf; pruning the last terminal
+    /// leaf clears the tree (no split left to show).
     func closeSplitLeaf(_ id: SplitLeafID) {
         guard case .pane(let deviceID, let paneID) = id, splitTree != nil else { return }
         splitOpenTasks[id]?.cancel()
         splitOpenTasks[id] = nil
-        guard let (pruned, removed) = pruneTerminalLeaf(deviceID: deviceID, paneID: paneID) else { return }
-        coverKeys(for: [removed])
-        updateSplitTree { $0 = pruned }
-        spawnSplitPaneCloser([removed])
+        guard let pruned = pruneTerminalLeaf(deviceID: deviceID, paneID: paneID) else { return }
+        coverKeys(for: [pruned.removed])
+        if hasTerminalLeaves(pruned.tree) {
+            updateSplitTree { $0 = pruned.tree }
+            if focusedSplitLeaf == id {
+                focusedSplitLeaf = nearestSurvivingLeaf(after: pruned) ?? .agent
+            }
+        } else {
+            // Last terminal leaf gone: nothing left to split around.
+            updateSplitTree { $0 = nil }
+            splitTerminal = nil
+            focusedSplitLeaf = .agent
+            activeSplitSide = .agent
+        }
+        spawnSplitPaneCloser([pruned.removed])
+    }
+
+    private func hasTerminalLeaves(_ node: SplitNode?) -> Bool {
+        guard let node else { return false }
+        switch node {
+        case .leaf(.agent): return false
+        case .leaf(.terminal): return true
+        case .split(_, _, let first, let second): return hasTerminalLeaves(first) || hasTerminalLeaves(second)
+        }
+    }
+
+    /// The surviving leaf nearest to a removed pane: the extreme leaf of the
+    /// promoted sibling, on the side facing the removal. `pruned` carries the
+    /// promotion record; falls back to the tree's first leaf.
+    private func nearestSurvivingLeaf(after pruned: PrunedLeafRemoval) -> SplitLeafID? {
+        if let sibling = pruned.sibling, let axis = pruned.parentAxis {
+            _ = axis
+            // Removed was first (left/top) → the survivor sits right/below →
+            // nearest is its leftmost/topmost leaf; removed second →
+            // rightmost/bottommost.
+            return extremeLeafID(in: sibling, firstmost: pruned.removedWasFirst)
+        }
+        return firstLeafID(in: pruned.tree)
+    }
+
+    /// Leftmost/topmost (firstmost) or rightmost/bottommost leaf of a subtree.
+    /// For vertical splits first == left, for horizontal first == top.
+    private func extremeLeafID(in node: SplitNode, firstmost: Bool) -> SplitLeafID? {
+        switch node {
+        case .leaf(.agent): return .agent
+        case .leaf(.terminal(let pane)): return .pane(deviceID: pane.device.id, paneID: pane.paneID)
+        case .split(_, _, let first, let second):
+            return extremeLeafID(in: firstmost ? first : second, firstmost: firstmost)
+        }
+    }
+
+    private func firstLeafID(in node: SplitNode?) -> SplitLeafID? {
+        guard let node else { return nil }
+        return extremeLeafID(in: node, firstmost: true)
+    }
+
+    /// Prune record: the post-prune tree plus what the removal promoted.
+    /// `sibling` is the promoted sibling subtree (nil when the removed leaf
+    /// was the tree's only leaf); `parentAxis` is the collapsed split's axis.
+    private struct PrunedLeafRemoval {
+        var tree: SplitNode?
+        var removed: SplitPane
+        var sibling: SplitNode?
+        var removedWasFirst: Bool
+        var parentAxis: SplitAxis?
     }
 
     /// Removes the terminal leaf from the tree, collapsing its parent to the
-    /// surviving sibling. Returns the pruned tree (nil if it was the only
-    /// leaf) plus the removed pane, or nil if the pane isn't in the tree.
-    private func pruneTerminalLeaf(deviceID: UUID, paneID: String) -> (SplitNode?, SplitPane)? {
-        guard let tree = splitTree else { return nil }
-        func prune(_ node: SplitNode) -> (SplitNode?, SplitPane?) {
+    /// surviving sibling. Returns the prune record, or nil if the pane isn't
+    /// in the tree.
+    private func pruneTerminalLeaf(deviceID: UUID, paneID: String) -> PrunedLeafRemoval? {
+        guard splitTree != nil else { return nil }
+        func prune(_ node: SplitNode) -> (SplitNode?, PrunedLeafRemoval?) {
             switch node {
             case .leaf(.agent):
                 return (node, nil)
             case .leaf(.terminal(let pane)) where pane.device.id == deviceID && pane.paneID == paneID:
-                return (nil, pane)
+                return (nil, PrunedLeafRemoval(tree: nil, removed: pane, sibling: nil, removedWasFirst: false, parentAxis: nil))
             case .leaf:
                 return (node, nil)
             case .split(let axis, let ratio, let first, let second):
-                let (firstPruned, removed) = prune(first)
-                if let removed {
-                    // Collapses to the surviving sibling.
-                    return (firstPruned ?? second, removed)
+                let (firstPruned, firstHit) = prune(first)
+                if var hit = firstHit {
+                    // A nil replacement means `first` was the removed leaf itself
+                    // (deeper removals always leave a collapsed subtree behind),
+                    // so the promoted sibling is `second` — unless a deeper
+                    // level already recorded one.
+                    if firstPruned == nil, hit.sibling == nil {
+                        hit.sibling = second
+                        hit.removedWasFirst = true
+                        hit.parentAxis = axis
+                    }
+                    hit.tree = firstPruned ?? second
+                    return (firstPruned ?? second, hit)
                 }
-                let (secondPruned, removedSecond) = prune(second)
-                if let removedSecond {
-                    return (secondPruned ?? first, removedSecond)
+                let (secondPruned, secondHit) = prune(second)
+                if var hit = secondHit {
+                    if secondPruned == nil, hit.sibling == nil {
+                        hit.sibling = first
+                        hit.removedWasFirst = false
+                        hit.parentAxis = axis
+                    }
+                    hit.tree = secondPruned ?? first
+                    return (secondPruned ?? first, hit)
                 }
                 return (.split(axis: axis, ratio: ratio, first: first, second: second), nil)
             }
         }
-        let (pruned, removed) = prune(tree)
-        guard let removed else { return nil }
-        return (pruned, removed)
+        let (_, hit) = prune(splitTree!)
+        return hit
     }
 
     /// Re-covers panes before unpublishing: without this a dying pane renders
@@ -976,6 +1053,115 @@ final class AppModel: ObservableObject {
                 await refresh(group.device.id)
             }
         }
+    }
+
+    /// Arrow-key direction for focus moves and divider nudges.
+    enum SplitDirection {
+        case left, right, up, down
+    }
+
+    /// Child-index trail from the root to a leaf (0 = first, 1 = second).
+    /// Nil when the leaf isn't in the tree.
+    private func leafPath(_ id: SplitLeafID) -> [Int]? {
+        func find(_ node: SplitNode) -> [Int]? {
+            switch node {
+            case .leaf(.agent):
+                return id == .agent ? [] : nil
+            case .leaf(.terminal(let pane)):
+                return id == .pane(deviceID: pane.device.id, paneID: pane.paneID) ? [] : nil
+            case .split(_, _, let first, let second):
+                if let path = find(first) { return [0] + path }
+                if let path = find(second) { return [1] + path }
+                return nil
+            }
+        }
+        guard let tree = splitTree else { return nil }
+        return find(tree)
+    }
+
+    /// The leaf adjacent to `id` in `direction`, from tree structure (classic
+    /// guillotine neighbor: up from the focused leaf to the first ancestor
+    /// split facing that way, then the extreme leaf of the sibling subtree).
+    /// No geometry needed — the tree already encodes adjacency.
+    func neighbor(of id: SplitLeafID, direction: SplitDirection) -> SplitLeafID? {
+        guard let tree = splitTree, let path = leafPath(id), !path.isEmpty else { return nil }
+        let wantAxis: SplitAxis = (direction == .left || direction == .right) ? .vertical : .horizontal
+        // Ancestor splits from nearest to root, with the taken child index.
+        var node = tree
+        var ancestors: [(axis: SplitAxis, index: Int, sibling: SplitNode)] = []
+        for index in path {
+            guard case .split(let axis, _, let first, let second) = node else { return nil }
+            ancestors.append((axis, index, index == 0 ? second : first))
+            node = index == 0 ? first : second
+        }
+        for ancestor in ancestors.reversed() {
+            guard ancestor.axis == wantAxis else { continue }
+            let towardStart = (direction == .left || direction == .up)
+            // left/up leaves via the second child; right/down via the first.
+            // The nearest leaf of the sibling faces the crossing: the sibling
+            // on the far side contributes its firstmost (leftmost/topmost)
+            // leaf, the near-side sibling its lastmost.
+            guard (ancestor.index == 1) == towardStart else { continue }
+            return extremeLeafID(in: ancestor.sibling, firstmost: !towardStart)
+        }
+        return nil
+    }
+
+    /// Moves the keyboard to the neighboring leaf in `direction`. No-op when
+    /// there is no neighbor (edge of the layout) or its view isn't ready —
+    /// the tracker reports the actual focus, so a failed move changes nothing.
+    func focusNeighbor(_ direction: SplitDirection) {
+        guard let next = neighbor(of: focusedSplitLeaf, direction: direction) else { return }
+        focusSplitLeaf(next)
+    }
+
+    /// Puts the keyboard on a leaf's view. Falls back from the registry to the
+    /// last-known side views (agent side has no registry entry — its stack is
+    /// selection-dependent). The tracker's KVO report is the source of truth
+    /// for `focusedSplitLeaf`; this only moves the responder.
+    func focusSplitLeaf(_ id: SplitLeafID) {
+        let view: NSView? = SplitLeafViewRegistry.view(for: id)
+            ?? (id == .agent ? splitAgentView : splitShellView)
+        guard let view, let window = view.window else { return }
+        window.makeFirstResponder(view)
+    }
+
+    /// Reads the ratio of the split node at `path` (child indices from root).
+    /// Nil when the path doesn't resolve to a split node.
+    private func splitRatio(at path: [Int]) -> Double? {
+        var node = splitTree
+        for index in path {
+            guard case .split(_, _, let first, let second) = node else { return nil }
+            node = index == 0 ? first : second
+        }
+        guard case .split(_, let ratio, _, _) = node else { return nil }
+        return ratio
+    }
+
+    /// Nudges the focused leaf's nearest same-direction ancestor divider by 5%
+    /// toward the pressed arrow. No-op when no such divider exists (leaf edge
+    /// facing the other axis) — safe by the ⌘D lesson: never gate on
+    /// `.disabled()`, just do nothing on unexpected focus.
+    func nudgeFocusedLeaf(arrow: SplitDirection) {
+        guard splitTree != nil, let path = leafPath(focusedSplitLeaf), !path.isEmpty else { return }
+        let wantAxis: SplitAxis = (arrow == .left || arrow == .right) ? .vertical : .horizontal
+        // Nearest ancestor split (node path + taken index) with a matching axis.
+        var node = splitTree
+        var match: (nodePath: [Int], index: Int)?
+        var prefix: [Int] = []
+        for index in path {
+            guard case .split(let axis, _, let first, let second) = node else { return }
+            if axis == wantAxis { match = (prefix, index) }
+            prefix.append(index)
+            node = index == 0 ? first : second
+        }
+        guard let match, let current = splitRatio(at: match.nodePath) else { return }
+        // Right/down arrows expand toward the edge: a first-child focus grows
+        // by raising the ratio, a second-child focus by lowering it; left/up
+        // arrows mirror.
+        let towardEdge = (arrow == .right || arrow == .down)
+        let delta = (towardEdge == (match.index == 0)) ? 0.05 : -0.05
+        setSplitRatio(current + delta, at: match.nodePath)
     }
 
     // MARK: - Lifecycle

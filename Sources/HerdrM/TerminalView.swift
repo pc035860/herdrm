@@ -1092,6 +1092,29 @@ enum SplitLeafViewRegistry {
         defer { lock.unlock() }
         return views[key(for: leaf)]?.view
     }
+
+    /// Reverse lookup: the leaf whose registered view contains `view` (the view
+    /// itself or an ancestor). Prunes dead weak entries on the way. Stale keys
+    /// are harmless otherwise: pane-ID reuse overwrites them on re-register,
+    /// and closed panes leave nil weaks that never match.
+    static func leaf(containing view: NSView) -> AppModel.SplitLeafID? {
+        lock.lock()
+        defer { lock.unlock() }
+        for (key, weakView) in views {
+            guard let registered = weakView.view else { views[key] = nil; continue }
+            if registered === view || view.isDescendant(of: registered) {
+                return leafID(forKey: key)
+            }
+        }
+        return nil
+    }
+
+    private static func leafID(forKey key: String) -> AppModel.SplitLeafID? {
+        if key == "agent" { return .agent }
+        let parts = key.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let deviceID = UUID(uuidString: parts[0]) else { return nil }
+        return .pane(deviceID: deviceID, paneID: parts[1])
+    }
 }
 
 enum AttachViewRegistry {

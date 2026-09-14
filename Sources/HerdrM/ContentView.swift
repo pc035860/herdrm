@@ -50,7 +50,6 @@ struct RootView: View {
                 .hidden()
         )
         .focusedSceneValue(\.appModel, model)
-        .focusedSceneValue(\.splitAxis, model.shellSplitAxis)
         .sheet(isPresented: $model.showSearch) { SearchSheet(model: model) }
         .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: 980, minHeight: 620)
@@ -568,11 +567,11 @@ struct DetailView: View {
             onAttachmentError: { model.actionError = $0 },
             onExit: { _ in model.shellSplitAxis = nil },
             onViewReady: {
-                splitTracker.shellView = $0
+                SplitLeafViewRegistry.register($0, for: .pane(deviceID: pane.device.id, paneID: pane.paneID))
                 model.splitShellView = $0
             }
         )
-        .id("split-\\(pane.paneID)")
+        .id("split-\(pane.paneID)")
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         // Same solid-backdrop treatment as attachChild: Ghostty's non-opaque
@@ -635,9 +634,14 @@ struct DetailView: View {
             .onAppear {
                 // Single source of truth: the tracker writes straight into the model
                 // instead of holding its own copy for a second onChange to mirror.
-                splitTracker.onSideChanged = { model.activeSplitSide = $0 }
-                splitTracker.isAgentView = { view in
-                    AttachViewRegistry.liveViews.contains { $0 === view }
+                splitTracker.onLeafChanged = { model.focusedSplitLeaf = $0 }
+                splitTracker.resolveLeaf = { view in
+                    // The agent side first: its stack is selection-dependent, so
+                    // it has no registry entry (see SplitFocusTracker's note).
+                    if AttachViewRegistry.liveViews.contains(where: { $0 === view || view.isDescendant(of: $0) }) {
+                        return .agent
+                    }
+                    return SplitLeafViewRegistry.leaf(containing: view)
                 }
                 splitTracker.start()
             }
@@ -669,16 +673,6 @@ struct DetailView: View {
                     model.activeSplitSide = .agent
                     model.pendingSplitAgentFocus = false
                     focusRemainingTerminal(preferring: model.splitAgentView)
-                }
-            }
-            // Step-2 bridge: the tracker still reports sides; the canvas dims
-            // by leaf. Mirrors the side into the focused leaf (step 3 removes
-            // sides and tracks leaves directly).
-            .onChange(of: model.activeSplitSide) { _, side in
-                if side == .agent {
-                    model.focusedSplitLeaf = .agent
-                } else if let split = model.splitTerminal {
-                    model.focusedSplitLeaf = .pane(deviceID: split.device.id, paneID: split.paneID)
                 }
             }
         } else {
