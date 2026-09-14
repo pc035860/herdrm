@@ -160,27 +160,52 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    /// The herdr pane behind the ⌘D split: a real server-side sibling pane in
-    /// the same tab — beside the agent, on the same device — not a local shell
-    /// and not a separate tab. Ephemeral by design: closing the split closes
-    /// the pane.
-    struct SplitTerminal: Equatable {
+    /// One split pane: a real server-side terminal pane owned by the split
+    /// (renamed from SplitTerminal — leaves are panes now, terminals attach
+    /// to them). Ephemeral by design: closing the split closes the pane.
+    struct SplitPane: Equatable {
         let device: Device
         let paneID: String
         let target: TerminalAttachTarget
     }
-    @Published var splitTerminal: SplitTerminal?
+    /// A tree leaf: the agent side (virtual — renders the selected attach
+    /// stack, owns no server pane) or one split terminal (owns its pane).
+    enum SplitLeaf: Equatable {
+        case agent
+        case terminal(SplitPane)
+    }
+    /// Stable identity for focus, tasks, and concealment. Device-scoped:
+    /// pane IDs can collide across devices (same key shape as the conceal set).
+    enum SplitLeafID: Hashable {
+        case agent
+        case pane(deviceID: UUID, paneID: String)
+    }
+    indirect enum SplitNode: Equatable {
+        case leaf(SplitLeaf)
+        case split(axis: SplitAxis, ratio: Double, first: SplitNode, second: SplitNode)
+    }
+    /// The split tree. Nil == no split. Source of truth from step 1 on;
+    /// the `shellSplitAxis`/`splitTerminal` shims below mirror it until the
+    /// canvas (step 2) and menu (step 3) read the tree directly.
+    @Published var splitTree: SplitNode?
+    /// The leaf holding the keyboard. Default `.agent`; wired to the focus
+    /// tracker in step 3 (until then the agent leaf is always the focus).
+    @Published var focusedSplitLeaf: SplitLeafID = .agent
+    /// Shim for the step-2 rendering, which still reads this. Mirrors the
+    /// tree's newest terminal leaf at depth 1; cleared with the tree.
+    @Published var splitTerminal: SplitPane?
     /// Pane IDs concealed from the sidebar, search, and auto-selection while
     /// the split owns them. Inserted right after `pane.split` (before the first
-    /// refresh can publish the new pane) and removed once `splitTerminal` takes
-    /// over or the pane is cleaned up — so the ephemeral pane never renders a
+    /// refresh can publish the new pane) and removed once the tree takes
+    /// over or the pane is cleaned up — so an ephemeral pane never renders a
     /// selectable row anywhere. Best-effort for one hop only: an event-driven
     /// refresh landing between `pane.split` and conceal still flashes it for a
     /// frame, then it self-heals on the next render.
     private var concealedSplitPaneIDs = Set<String>()
-    /// The in-flight `openSplit` task, if any. Repeat ⌘D presses while the tab
-    /// is being created are ignored instead of stacking up panes.
-    private var splitOpenTask: Task<Void, Never>?
+    /// In-flight `openSplit` tasks, keyed per leaf. Repeat ⌘D presses on a
+    /// leaf hit its own dedup slot instead of stacking up panes, and closing
+    /// leaf A never cancels leaf B's in-flight open.
+    private var splitOpenTasks: [SplitLeafID: Task<Void, Never>] = [:]
 
     private static func splitPaneKey(deviceID: UUID, paneID: String) -> String {
         "\(deviceID.uuidString)/\(paneID)"
@@ -193,7 +218,62 @@ final class AppModel: ObservableObject {
     /// opened. Device-scoped: pane IDs can collide across devices.
     func isSplitPane(deviceID: UUID, paneID: String) -> Bool {
         concealedSplitPaneIDs.contains(Self.splitPaneKey(deviceID: deviceID, paneID: paneID))
-            || (splitTerminal?.paneID == paneID && splitTerminal?.device.id == deviceID)
+            || treeSplitPaneKeys().contains(Self.splitPaneKey(deviceID: deviceID, paneID: paneID))
+    }
+
+    /// All terminal leaves' conceal keys, by walking the tree. Every consumer
+    /// (sidebar, drag targets, auto-selection, placeholder counts, ⌘K search,
+    /// snapshot focus) reads `isSplitPane`, so one predicate covers N panes.
+    private func treeSplitPaneKeys() -> Set<String> {
+        guard let tree = splitTree else { return [] }
+        var out = Set<String>()
+        func walk(_ node: SplitNode) {
+            switch node {
+            case .leaf(.agent): break
+            case .leaf(.terminal(let pane)):
+                out.insert(Self.splitPaneKey(deviceID: pane.device.id, paneID: pane.paneID))
+            case .split(_, _, let first, let second): walk(first); walk(second)
+            }
+        }
+        walk(tree)
+        return out
+    }
+
+    /// All terminal panes in the tree, pre-order.
+    private func terminalSplitPanes() -> [SplitPane] {
+        guard let tree = splitTree else { return [] }
+        var out: [SplitPane] = []
+        func walk(_ node: SplitNode) {
+            switch node {
+            case .leaf(.agent): break
+            case .leaf(.terminal(let pane)): out.append(pane)
+            case .split(_, _, let first, let second): walk(first); walk(second)
+            }
+        }
+        walk(tree)
+        return out
+    }
+
+    /// Whether the tree still contains the pane (close-path reuse guard — a
+    /// newer split may own a recycled pane ID).
+    private func treeContainsPane(deviceID: UUID, paneID: String) -> Bool {
+        treeSplitPaneKeys().contains(Self.splitPaneKey(deviceID: deviceID, paneID: paneID))
+    }
+
+    /// The device the tree lives on (any terminal leaf's device). By induction
+    /// — the same-device guard keeps agent-leaf splits on-tree, terminal
+    /// leaves inherit their pane's device — all leaves always share one
+    /// device, so this is well-defined. Used by the step-4 creation path.
+    func treeDevice() -> Device? {
+        terminalSplitPanes().first?.device
+    }
+
+    /// Sole mutation point for `splitTree`. Dropping a terminal leaf here does
+    /// NOT close its pane — route every removal through `closeSplitLeaf`, so
+    /// the close-pane side effect can't be bypassed (replaces the
+    /// axis-didSet funnel once the shims are gone in step 5).
+    private func updateSplitTree(_ transform: (inout SplitNode?) -> Void) {
+        transform(&splitTree)
     }
 
     func isSplitPane(_ entry: TerminalEntry) -> Bool {
@@ -671,15 +751,23 @@ final class AppModel: ObservableObject {
 
     // MARK: - Split terminal (⌘D)
 
-    /// Opens the split as a sibling herdr pane beside the selected entry.
-    /// Re-pressing with the split open only re-aims the divider, keeping the
-    /// same pane — matching what re-setting the axis did for the old shell.
+    /// Opens the split as a sibling herdr pane beside the focused leaf.
+    /// Step 1: agent-leaf creation only (focus is always `.agent` until the
+    /// tracker lands in step 3); re-pressing with a tree open re-aims the
+    /// root, preserving depth-1 behavior. Terminal-leaf creation (nesting)
+    /// and the same-device guard land in step 4.
     func openSplit(axis: SplitAxis) {
-        if splitTerminal != nil {
+        if splitTree != nil {
+            updateSplitTree { tree in
+                guard case .split(_, let ratio, let first, let second) = tree else { return }
+                tree = .split(axis: axis, ratio: ratio, first: first, second: second)
+            }
             shellSplitAxis = axis
             return
         }
-        guard splitOpenTask == nil, let entry = selectedAttachedEntry else { return }
+        guard focusedSplitLeaf == .agent, splitOpenTasks[.agent] == nil,
+              let entry = selectedAttachedEntry
+        else { return }
         let device = entry.device
         let entryID = entry.id
         let targetPaneID = entry.ref.paneID
@@ -692,11 +780,11 @@ final class AppModel: ObservableObject {
         case .agent(let agentEntry): agentEntry.agent.cwd
         case .terminal(let terminalEntry): terminalEntry.pane.cwd
         }
-        splitOpenTask = Task {
-            // Only the current task may clear the slot: a cancelled task can
-            // resume after closeSplitTerminal already installed a newer one,
-            // and a blind nil-out would drop the dedup guard and orphan panes.
-            defer { if !Task.isCancelled { splitOpenTask = nil } }
+        splitOpenTasks[.agent] = Task {
+            // Only the current task may clear its slot: a cancelled task can
+            // resume after a close already installed a newer one, and a blind
+            // nil-out would drop the dedup guard and orphan panes.
+            defer { if !Task.isCancelled { splitOpenTasks[.agent] = nil } }
             let paneID: String
             do {
                 // A true sibling split in the SAME tab (not a new tab): the
@@ -739,52 +827,123 @@ final class AppModel: ObservableObject {
                 }
                 return
             }
-            splitTerminal = SplitTerminal(
+            let newPane = SplitPane(
                 device: device,
                 paneID: paneID,
                 target: .terminal(terminalID: terminal.terminalID)
             )
+            // Root creation seeds the persisted ratio (the user's dragged
+            // position survives, as today); deeper nodes seed 0.5 in step 4.
+            updateSplitTree { tree in
+                tree = .split(axis: axis, ratio: splitRatio, first: .leaf(.agent), second: .leaf(.terminal(newPane)))
+            }
+            // Shims for the step-2 rendering/menu, which still read these.
+            splitTerminal = newPane
             shellSplitAxis = axis
         }
     }
 
-    /// Closes the split's herdr pane, if any. Cleanup runs detached from the
-    /// UI state change, and pane-close failures are swallowed: the pane may
+    /// Closes every split pane and clears the tree. Cleanup runs detached from
+    /// the UI state change, and pane-close failures are swallowed: a pane may
     /// already be gone (taken over, closed from the sidebar), which is a fine
     /// end state. Deliberately still closes on takeover — an ephemeral pane
     /// has no second life outside the split, so collapsing without closing
     /// would strand it with no UI left to reach it (it is hidden everywhere).
     private func closeSplitTerminal() {
-        splitOpenTask?.cancel()
-        splitOpenTask = nil
-        guard let split = splitTerminal else { return }
-        // Re-cover before unpublishing: the success path already surrendered
-        // the conceal key at task end, so without this the dying pane renders
-        // a selectable sidebar row until closePane + refresh land.
-        let concealKey = Self.splitPaneKey(deviceID: split.device.id, paneID: split.paneID)
-        concealedSplitPaneIDs.insert(concealKey)
+        splitOpenTasks.values.forEach { $0.cancel() }
+        splitOpenTasks.removeAll()
+        guard splitTree != nil else { return }
+        let doomed = terminalSplitPanes()
+        coverKeys(for: doomed)
+        updateSplitTree { $0 = nil }
         splitTerminal = nil
+        focusedSplitLeaf = .agent
+        activeSplitSide = .agent
+        spawnSplitPaneCloser(doomed)
+    }
+
+    /// Prunes one terminal leaf: collapses its parent to the surviving sibling
+    /// and closes the leaf's pane. Agent-leaf close goes through the
+    /// `shellSplitAxis = nil` funnel (whole-tree collapse above), not here.
+    func closeSplitLeaf(_ id: SplitLeafID) {
+        guard case .pane(let deviceID, let paneID) = id, splitTree != nil else { return }
+        splitOpenTasks[id]?.cancel()
+        splitOpenTasks[id] = nil
+        guard let (pruned, removed) = pruneTerminalLeaf(deviceID: deviceID, paneID: paneID) else { return }
+        coverKeys(for: [removed])
+        updateSplitTree { $0 = pruned }
+        spawnSplitPaneCloser([removed])
+    }
+
+    /// Removes the terminal leaf from the tree, collapsing its parent to the
+    /// surviving sibling. Returns the pruned tree (nil if it was the only
+    /// leaf) plus the removed pane, or nil if the pane isn't in the tree.
+    private func pruneTerminalLeaf(deviceID: UUID, paneID: String) -> (SplitNode?, SplitPane)? {
+        guard let tree = splitTree else { return nil }
+        func prune(_ node: SplitNode) -> (SplitNode?, SplitPane?) {
+            switch node {
+            case .leaf(.agent):
+                return (node, nil)
+            case .leaf(.terminal(let pane)) where pane.device.id == deviceID && pane.paneID == paneID:
+                return (nil, pane)
+            case .leaf:
+                return (node, nil)
+            case .split(let axis, let ratio, let first, let second):
+                let (firstPruned, removed) = prune(first)
+                if let removed {
+                    // Collapses to the surviving sibling.
+                    return (firstPruned ?? second, removed)
+                }
+                let (secondPruned, removedSecond) = prune(second)
+                if let removedSecond {
+                    return (secondPruned ?? first, removedSecond)
+                }
+                return (node, nil)
+            }
+        }
+        let (pruned, removed) = prune(tree)
+        guard let removed else { return nil }
+        return (pruned, removed)
+    }
+
+    /// Re-covers panes before unpublishing: without this a dying pane renders
+    /// a selectable sidebar row until closePane + refresh land.
+    private func coverKeys(for panes: [SplitPane]) {
+        for pane in panes {
+            concealedSplitPaneIDs.insert(Self.splitPaneKey(deviceID: pane.device.id, paneID: pane.paneID))
+        }
+    }
+
+    /// Closes panes server-side, then refreshes each device once. Shared by
+    /// every close path so no removal can strand a pane.
+    private func spawnSplitPaneCloser(_ doomed: [SplitPane]) {
+        guard !doomed.isEmpty else { return }
         Task {
-            // Keep the conceal key until the post-close refresh lands: the pane
-            // still exists server-side for hundreds of ms, and dropping cover
-            // early would render a selectable row for a dying pane.
+            // Keep each conceal key until the post-close refresh lands: the
+            // pane still exists server-side for hundreds of ms, and dropping
+            // cover early would render a selectable row for a dying pane.
             defer {
-                // Don't drop a newer split's cover if the server ever reuses
-                // pane IDs between the close above and this removal.
-                if let current = splitTerminal,
-                   current.paneID == split.paneID,
-                   current.device.id == split.device.id {
-                    // A newer split owns this key now; its own close cycle
-                    // will remove it.
-                } else {
-                    concealedSplitPaneIDs.remove(concealKey)
+                for pane in doomed {
+                    // Tree-membership reuse guard: don't drop a newer split's
+                    // cover if the server ever recycles this pane ID.
+                    if !treeContainsPane(deviceID: pane.device.id, paneID: pane.paneID) {
+                        concealedSplitPaneIDs.remove(Self.splitPaneKey(deviceID: pane.device.id, paneID: pane.paneID))
+                    }
                 }
             }
-            // The device may be gone (removed mid-split): don't resurrect a
-            // service — let alone spawn a local server — for a doomed close.
-            guard device(split.device.id) != nil else { return }
-            try? await service(for: split.device).closePane(paneID: split.paneID)
-            await refresh(split.device.id)
+            var byDevice: [UUID: (device: Device, paneIDs: [String])] = [:]
+            for pane in doomed {
+                byDevice[pane.device.id, default: (pane.device, [])].paneIDs.append(pane.paneID)
+            }
+            for (_, group) in byDevice {
+                // The device may be gone (removed mid-split): don't resurrect
+                // a service — let alone spawn a local server — for a doomed close.
+                guard device(group.device.id) != nil else { continue }
+                for paneID in group.paneIDs {
+                    try? await service(for: group.device).closePane(paneID: paneID)
+                }
+                await refresh(group.device.id)
+            }
         }
     }
 

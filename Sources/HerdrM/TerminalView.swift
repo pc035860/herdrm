@@ -1056,6 +1056,44 @@ func applyTerminalAppearance(
 /// Lock-guarded rather than actor-isolated: register/unregister run on the main thread
 /// (make/dismantleNSView), but `liveViews` is also read from `SplitFocusTracker`'s KVO
 /// callbacks, which are nonisolated even though AppKit delivers them on the main thread.
+/// Weak leaf-ID→view map for split panes (nested-split step 1: type only;
+/// populated when the canvas lands in step 3). Same lock-guarded pattern as
+/// AttachViewRegistry: reads come from focus-tracker KVO callbacks.
+enum SplitLeafViewRegistry {
+    private struct WeakView { weak var view: LineBreakTerminalView? }
+    private static let lock = NSLock()
+    private static var views: [String: WeakView] = [:]
+
+    static func key(for leaf: AppModel.SplitLeafID) -> String {
+        switch leaf {
+        case .agent: return "agent"
+        case .pane(let deviceID, let paneID): return "\(deviceID.uuidString)/\(paneID)"
+        }
+    }
+
+    static func register(_ view: LineBreakTerminalView, for leaf: AppModel.SplitLeafID) {
+        register(view, forKey: key(for: leaf))
+    }
+
+    static func register(_ view: LineBreakTerminalView, forKey key: String) {
+        lock.lock()
+        views[key] = WeakView(view: view)
+        lock.unlock()
+    }
+
+    static func unregister(_ leaf: AppModel.SplitLeafID) {
+        lock.lock()
+        views[key(for: leaf)] = nil
+        lock.unlock()
+    }
+
+    static func view(for leaf: AppModel.SplitLeafID) -> LineBreakTerminalView? {
+        lock.lock()
+        defer { lock.unlock() }
+        return views[key(for: leaf)]?.view
+    }
+}
+
 enum AttachViewRegistry {
     private struct WeakView { weak var view: LineBreakTerminalView? }
     private static let lock = NSLock()
