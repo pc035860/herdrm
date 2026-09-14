@@ -96,14 +96,6 @@ struct SplitContainer<First: View, Second: View>: View {
     }
 }
 
-private enum SplitContainerRatioBounds {
-    static let bounds = 0.2...0.8
-
-    static func clamp(_ value: Double) -> Double {
-        Swift.min(Swift.max(value, bounds.lowerBound), bounds.upperBound)
-    }
-}
-
 /// Tracks which side of the ⌘D split holds the keyboard by KVO-observing the key
 /// window's `firstResponder`.
 ///
@@ -169,7 +161,3 @@ final class SplitFocusTracker {
         firstResponderObservation?.invalidate()
     }
 }
-
-/// Dims the inactive pane enough to show which side has the keyboard without making
-/// its text unreadable. Tuned visually; deliberately not exposed as a setting.
-private let inactivePaneOpacity = 0.55

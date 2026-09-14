@@ -490,53 +490,143 @@ struct DetailView: View {
     }
 
     @ViewBuilder
-    private var attachedTerminal: some View {
-        if let entry = model.selectedAttachedEntry {
-            SplitContainer(
-                axis: model.shellSplitAxis,
-                activeSide: model.activeSplitSide,
-                ratio: $model.splitRatio
-            ) {
-                // One structural position holding every kept-alive attach. Each child
-                // keeps a stable identity and is toggled by opacity, so switching the
-                // selection — or opening/closing the split — never tears a terminal
-                // down: its content survives the round trip. Do not key this on the
-                // selection; that rebuild-on-switch is exactly what this removes.
-                ZStack {
-                    ForEach(model.attachSessions) { session in
-                        attachChild(session, isSelected: session.id == entry.id)
+    /// The split canvas: every live attach mounted exactly once in a flat pool
+    /// (agent stack + split terminals), positioned by the tree's pure geometry.
+    /// Splits, collapses, and resizes only ever change rects \u2014 a live pane's
+    /// view is never moved or rebuilt, so its process survives every layout
+    /// change (a dismantle would kill the server pane). Depth 1 renders
+    /// pixel-identical to the old SplitContainer: same padding, backdrop,
+    /// divider, and dimming.
+    private func splitCanvas(entry: AppModel.AttachedEntry) -> some View {
+        GeometryReader { proxy in
+            let layout = splitLayout(
+                model.splitTree,
+                in: CGRect(origin: .zero, size: proxy.size)
+            )
+            ZStack(alignment: .topLeading) {
+                if let agentRect = layout.leaves[.agent] {
+                    // One structural position holding every kept-alive attach. Each child
+                    // keeps a stable identity and is toggled by opacity, so switching the
+                    // selection never tears a terminal down: its content survives the
+                    // round trip. Do not key this on the selection; that rebuild-on-switch
+                    // is exactly what this removes.
+                    ZStack {
+                        ForEach(model.attachSessions) { session in
+                            attachChild(session, isSelected: session.id == entry.id)
+                        }
+                    }
+                    .frame(width: agentRect.width, height: agentRect.height)
+                    .position(x: agentRect.midX, y: agentRect.midY)
+                    .opacity(canvasOpacity(for: .agent))
+                }
+                ForEach(model.poolSplitPanes(), id: \.poolID) { pane in
+                    if let rect = layout.leaves[.pane(deviceID: pane.device.id, paneID: pane.paneID)] {
+                        splitPoolChild(pane)
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
+                            .opacity(canvasOpacity(for: .pane(deviceID: pane.device.id, paneID: pane.paneID)))
                     }
                 }
-            } second: {
-                // The split is a real herdr pane in the agent's workspace (same
-                // device), attached like any terminal — not a local shell. It is
-                // created by openSplit and closed when the axis clears; the id
-                // keys the attach to its pane so a new split rebuilds cleanly.
-                if let split = model.splitTerminal {
-                    AttachTerminalView(
-                        device: split.device,
-                        target: split.target,
-                        serverVersion: model.serverVersion(deviceID: split.device.id),
-                        attachmentCapabilities: nil,
-                        fontName: terminalFontName,
-                        fontSize: terminalFontSize,
-                        thinStrokes: terminalThinStrokes,
-                        fontWeight: terminalFontWeight,
-                        lineSpacing: terminalLineSpacing,
-                        dark: colorScheme == .dark,
-                        mouseReporting: terminalMouseReporting,
-                        onAttachmentError: { model.actionError = $0 },
-                        onExit: { _ in model.shellSplitAxis = nil },
-                        onViewReady: {
-                            splitTracker.shellView = $0
-                            model.splitShellView = $0
-                        }
+                ForEach(layout.dividers) { divider in
+                    SplitCanvasDivider(
+                        axis: divider.axis,
+                        ratio: divider.ratio,
+                        total: divider.axis == .vertical ? proxy.size.width : proxy.size.height,
+                        onDrag: { model.setSplitRatio($0, at: divider.path) }
                     )
-                    .id("split-\(split.paneID)")
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
+                    .frame(width: divider.rect.width, height: divider.rect.height)
+                    .position(x: divider.rect.midX, y: divider.rect.midY)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func canvasOpacity(for leaf: AppModel.SplitLeafID) -> Double {
+        guard model.splitTree != nil else { return 1.0 }
+        return model.focusedSplitLeaf == leaf ? 1.0 : inactivePaneOpacity
+    }
+
+    /// One pooled split terminal: a real herdr pane in the agent's workspace
+    /// (same device), attached like any terminal \u2014 not a local shell. The id
+    /// keys the attach to its pane so a new split rebuilds cleanly; the pool
+    /// (keyed by `poolID`) keeps it mounted until its pane closes.
+    @ViewBuilder
+    private func splitPoolChild(_ pane: AppModel.SplitPane) -> some View {
+        AttachTerminalView(
+            device: pane.device,
+            target: pane.target,
+            serverVersion: model.serverVersion(deviceID: pane.device.id),
+            attachmentCapabilities: nil,
+            fontName: terminalFontName,
+            fontSize: terminalFontSize,
+            thinStrokes: terminalThinStrokes,
+            fontWeight: terminalFontWeight,
+            lineSpacing: terminalLineSpacing,
+            dark: colorScheme == .dark,
+            mouseReporting: terminalMouseReporting,
+            onAttachmentError: { model.actionError = $0 },
+            onExit: { _ in model.shellSplitAxis = nil },
+            onViewReady: {
+                splitTracker.shellView = $0
+                model.splitShellView = $0
+            }
+        )
+        .id("split-\\(pane.paneID)")
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        // Same solid-backdrop treatment as attachChild: Ghostty's non-opaque
+        // Metal layer needs an opaque background inside the compositing group
+        // or glyph AA renders pale.
+        .background(Theme.terminalBackground)
+    }
+
+    /// One canvas divider: the SplitContainer look (1pt hairline + 7pt grab
+    /// strip + resize cursor), writing drag ratios back to the tree node at
+    /// the divider's path. Positioned absolutely by the layout pass.
+    private struct SplitCanvasDivider: View {
+        let axis: SplitAxis
+        let ratio: Double
+        let total: CGFloat
+        let onDrag: (Double) -> Void
+
+        @State private var dragStartRatio: Double?
+
+        var body: some View {
+            Rectangle()
+                .fill(Theme.hairline)
+                .overlay(
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture()
+                                .onChanged { value in
+                                    guard total > 0 else { return }
+                                    let start = dragStartRatio ?? SplitContainerRatioBounds.clamp(ratio)
+                                    if dragStartRatio == nil { dragStartRatio = start }
+                                    let travelled = axis == .vertical
+                                        ? value.translation.width
+                                        : value.translation.height
+                                    onDrag(start + travelled / total)
+                                }
+                                .onEnded { _ in dragStartRatio = nil }
+                        )
+                        .onHover { hovering in
+                            if hovering {
+                                (axis == .vertical ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).set()
+                            } else {
+                                NSCursor.arrow.set()
+                            }
+                        }
+                )
+        }
+    }
+
+    @ViewBuilder
+    private var attachedTerminal: some View {
+        if let entry = model.selectedAttachedEntry {
+            splitCanvas(entry: entry)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Theme.terminalBackground)
             .overlay(alignment: .bottomTrailing) {
@@ -579,6 +669,16 @@ struct DetailView: View {
                     model.activeSplitSide = .agent
                     model.pendingSplitAgentFocus = false
                     focusRemainingTerminal(preferring: model.splitAgentView)
+                }
+            }
+            // Step-2 bridge: the tracker still reports sides; the canvas dims
+            // by leaf. Mirrors the side into the focused leaf (step 3 removes
+            // sides and tracks leaves directly).
+            .onChange(of: model.activeSplitSide) { _, side in
+                if side == .agent {
+                    model.focusedSplitLeaf = .agent
+                } else if let split = model.splitTerminal {
+                    model.focusedSplitLeaf = .pane(deviceID: split.device.id, paneID: split.paneID)
                 }
             }
         } else {

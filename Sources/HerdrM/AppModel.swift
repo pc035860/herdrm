@@ -167,6 +167,9 @@ final class AppModel: ObservableObject {
         let device: Device
         let paneID: String
         let target: TerminalAttachTarget
+
+        /// Pool identity: pane IDs can collide across devices.
+        var poolID: String { "\(device.id.uuidString)/\(paneID)" }
     }
     /// A tree leaf: the agent side (virtual — renders the selected attach
     /// stack, owns no server pane) or one split terminal (owns its pane).
@@ -252,6 +255,34 @@ final class AppModel: ObservableObject {
         }
         walk(tree)
         return out
+    }
+
+    /// The pool's contents: every live split attach, mounted exactly once and
+    /// keyed by `poolID`. The canvas renders these; the tree only positions them.
+    func poolSplitPanes() -> [SplitPane] { terminalSplitPanes() }
+
+    /// Writes a divider-drag ratio into the tree node at `path` (child indices
+    /// from the root; empty path = root). Root writes also persist to
+    /// `splitRatio`, so the depth-1 drag still restores the user's position.
+    func setSplitRatio(_ ratio: Double, at path: [Int]) {
+        let clamped = SplitContainerRatioBounds.clamp(ratio)
+        if path.isEmpty { splitRatio = clamped }
+        updateSplitTree { tree in
+            func set(_ node: inout SplitNode, _ path: ArraySlice<Int>) {
+                guard case .split(let axis, let current, var first, var second) = node else { return }
+                if path.isEmpty {
+                    node = .split(axis: axis, ratio: clamped, first: first, second: second)
+                } else if path.first == 0 {
+                    set(&first, path.dropFirst())
+                    node = .split(axis: axis, ratio: current, first: first, second: second)
+                } else if path.first == 1 {
+                    set(&second, path.dropFirst())
+                    node = .split(axis: axis, ratio: current, first: first, second: second)
+                }
+            }
+            guard tree != nil else { return }
+            set(&tree!, path[0...])
+        }
     }
 
     /// Whether the tree still contains the pane (close-path reuse guard — a
@@ -898,7 +929,7 @@ final class AppModel: ObservableObject {
                 if let removedSecond {
                     return (secondPruned ?? first, removedSecond)
                 }
-                return (node, nil)
+                return (.split(axis: axis, ratio: ratio, first: first, second: second), nil)
             }
         }
         let (pruned, removed) = prune(tree)
