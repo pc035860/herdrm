@@ -17,13 +17,6 @@ concealment).
 - Drag-reorder of panes, pane zoom, persisted multi-pane layouts. The tree
   is session state, rebuilt by hand each time like today.
 - iOS (`HerdrMobile`). macOS only, same as the current split.
-- Same-direction re-split of an already-split cell (see §4): columns beyond
-  two are built by splitting siblings, which covers realistic tiling; the
-  residual gap is accepted MVP scope, not an oversight.
-- First-child collapse relaunches the survivor's attach *client* (see §2):
-  the shell session itself survives server-side; only the view flickers and
-  refocuses. Accepted MVP scope for the same reason — the mitigation (hosting
-  attach processes outside view identity) is a substantially larger change.
 
 ## Current state (what must change)
 
@@ -45,6 +38,23 @@ All in `Sources/HerdrM` (`AppModel.swift`, `ContentView.swift`,
   closes *the* pane. Concealment (`concealedSplitPaneIDs` + `isSplitPane`)
   is pane-ID based but single-pane: the persistent half matches only
   `splitTerminal`, and set keys expire at each open-cycle end.
+
+## Load-bearing server behavior (verified live against the socket)
+
+- **Any attach-client disconnect reaps the bare terminal pane.** Killing the
+  `herdr terminal attach` client with SIGHUP (what `host.terminate()` sends)
+  *and* with SIGKILL both delete the server pane — there is no graceful vs
+  abrupt distinction. Consequence: **a live pane's view must never unmount**,
+  on split *or* collapse, at any depth. Every dismantle is a kill. This
+  single fact rules out all rendering strategies that move or rebuild live
+  attaches (including naive recursive containers and first-child-collapse
+  promotion), and it is the reason §2 below mounts every attach exactly
+  once and only ever changes frames.
+- **Scrollback is retained server-side and re-synced on attach** (verified:
+  `pane read --source recent` returns full history; a fresh attach draws a
+  full screen including history lines). Re-attach after an accepted remount
+  (takeover recovery) preserves visible content; only lines older than the
+  resync window can drop.
 
 ## Design
 
@@ -80,9 +90,9 @@ indirect enum SplitNode: Equatable {
   and ephemeral panes have no stable cross-session identity.
 - `isSplitPane` is rewritten to walk the tree's terminal leaves (plus the
   transient creation set, unchanged). Single-`splitTerminal` matching goes
-  away. This covers sidebar, drag targets, auto-selection fallback,
-  placeholder counts, ⌘K search, *and* snapshot focus auto-selection —
-  every consumer reads the same predicate, so no new bypass can open.
+  away. Every consumer — sidebar, drag targets, auto-selection fallback,
+  placeholder counts, ⌘K search, snapshot focus auto-selection — reads the
+  same predicate, so no bypass can open.
 - `openSplit(axis:)` targets the *focused leaf's* herdr pane (agent leaf →
   selected entry's pane; terminal leaf → its pane, resolved via
   `terminalEntries(for:)` for cwd) and replaces that leaf with
@@ -106,85 +116,86 @@ indirect enum SplitNode: Equatable {
     per creation exactly as today.
 - Closing (`closeSplitLeaf(_:)`): closes *every* terminal descendant
   post-order (each `pane.close` + per-leaf conceal discipline — collapsing
-  must never strand server panes), then collapses the parent
-  (`split → surviving sibling`). Closing the agent leaf collapses the whole
-  tree (`splitTree = nil`), preserving today's "⌘W on agent closes the
-  split" feel. All mutations go through `updateSplitTree(_:)` so the
-  close-pane side effect can't be bypassed (replaces the axis-didSet funnel).
-- Focus restoration: closing an inner leaf sets `focusedSplitLeaf` to the
-  surviving sibling. The view layer resolves leaf IDs to views through a
-  weak `SplitLeafViewRegistry` (populated in `onViewReady`, parallel to
-  `AttachViewRegistry`); dimming stays compositional from the tree and
-  needs no registry.
+  must never strand server panes), then prunes the subtree. Closing the
+  agent leaf collapses the whole tree (`splitTree = nil`), preserving
+  today's "⌘W on agent closes the split" feel. All mutations go through
+  `updateSplitTree(_:)` so the close-pane side effect can't be bypassed
+  (replaces the axis-didSet funnel).
+- Focus restoration: closing a leaf sets `focusedSplitLeaf` to the nearest
+  surviving leaf and performs an explicit `makeFirstResponder` on its view
+  resolved through the registry (today's analogue is
+  `focusRemainingTerminal`; there is no remount to self-focus, by design).
 - The close-path reuse guard compares against tree membership (pane ID
   still in tree), not a single stored pane.
 
-### 2. Recursive rendering (`ContentView.swift`, `SplitContainer.swift`)
+### 2. Rendering: flat pool + tree-driven geometry (NOT nested containers)
 
-Core identity rule (generalizes the root trick — a recursive case switch
-between *different view types* would itself reset identity and relaunch
-attaches, so the recursion must not work that way):
+A naive recursion (each split node a `SplitContainer` holding child views)
+fails the load-bearing invariant: collapsing a first-child leaf promotes
+the survivor's cell one level up, remounting its attach — and remounting
+kills the pane (§0). Nesting by moving views is equally fatal on the split
+path. So the tree never owns views:
 
-- Every pane owns a `LeafCell` that **permanently** renders one
-  `SplitContainer`: the pane's own attach lives in `first()` forever
-  (agent cell: the kept-alive attach stack, verbatim as today; terminal
-  cell: its `AttachTerminalView` keyed by pane ID), and splitting flips
-  that cell's `axis` nil→value while mounting the new subtree in
-  `second()` (empty when unsplit — `SplitContainer` already skips
-  divider+second on nil axis). Axis flips go through the existing
-  `AnyLayout` mechanism, exactly like today's nil→split transition.
-- Consequence: an attach never changes structural position *on split*, at
-  any depth. Splits only ever *add* a `second()` sibling and flip one axis.
-  The one exception is first-child *collapse*: `split(first, second)` can only
-  collapse to `second` by promoting the survivor's cell one level up, which
-  remounts its attach (process terminated + `--takeover` re-attach + view
-  flicker; the shell session survives server-side). This is accepted scope
-  (see Non-goals): the close path sets `focusedSplitLeaf` to the survivor,
-  and the rebuilt attach self-focuses via `makeNSView`, so the "steal" lands
-  exactly where restoration wanted the keyboard anyway.
-- Structural invariant the mapping depends on: **every split node's first
-  child is always a leaf**, so the first-child leaf's cell renders that
-  node's container. It holds under all specified operations (splits replace
-  a leaf with `split(leaf, …)`; the §4 same-axis no-op prevents the
-  violation re-splitting would cause; collapse promotes a sibling whose own
-  first child is still a leaf) — which is also why the no-op rule and this
-  guarantee are two sides of the same coin, not coincidence.
-- New `SplitTreeView` maps the model tree to nested `LeafCell`s 1:1.
-  `SplitContainer` itself is untouched. Focus dimming: the focused leaf
-  renders full opacity, all others dimmed (today's `inactivePaneOpacity`).
+- **Pool**: every split attach is mounted exactly once in a flat
+  `ForEach(liveSplitPanes, id: \.paneID)` pool (the kept-alive
+  `attachSessions` pattern generalized), plus the agent stack mounted once
+  as today. Pool membership ⟺ pane lifetime: views are added on open and
+  removed only with their pane's close/death. **A live pane's view is never
+  removed, moved, or rebuilt — on split, collapse, re-aim, or resize, at
+  any depth.** This is the whole identity strategy, and it has no
+  exceptions.
+- **Geometry**: a pure function `layout(tree, size) -> [SplitLeafID: CGRect]`
+  partitions the container rect recursively (axis + ratio per node). Each
+  pooled view is positioned by its leaf's rect (`.frame` + `.position`) and
+  dimmed unless focused. The function is UI-framework-free and unit-testable.
+- **Dividers**: an overlay layer renders one draggable divider per split
+  node from the same layout pass (drag math reused from `SplitContainer`;
+  writes go through `updateSplitTree`). `SplitContainer` is retired once
+  the canvas lands (verify no other consumers first) — a two-child generic
+  cannot express N-pane geometry, and keeping it alongside invites mixing
+  the two strategies.
+- Because geometry (not structure) carries nesting, same-direction re-split
+  of the focused pane is safe: the focused attach keeps its pool position
+  and only shrinks, the new pane mounts fresh. No MVP limitation remains —
+  any binary guillotine layout is reachable.
+- Focus dimming generalizes today's `inactivePaneOpacity`: focused leaf
+  full opacity, all others dimmed.
 
 ### 3. Focus tracking (`TerminalView.swift`)
 
-- `SplitFocusTracker` reports a `SplitLeafID` instead of a side through a
-  single `(NSView) -> SplitLeafID?` resolver. The resolver consumes the same
-  `SplitLeafViewRegistry` the focus commands use (reverse lookup: is the
-  responder or an ancestor a registered leaf view?) — one source of truth
-  for leaf→view, instead of a separate view-tagging mechanism. No side enum,
-  no per-side stored refs, same no-cache discipline (reports every change,
-  never dedupes).
+- `SplitFocusTracker` reports a `SplitLeafID` through a single
+  `(NSView) -> SplitLeafID?` resolver consuming the `SplitLeafViewRegistry`
+  (reverse lookup: is the responder or an ancestor a registered leaf view?)
+  — one source of truth for leaf→view. Exception: the agent side keeps the
+  `AttachViewRegistry.liveViews` check (a leaf registry keyed ID→view fits
+  terminal leaves with one view each, not `.agent` with its
+  selection-dependent stack — the staleness warning at
+  `SplitContainer.swift:96-101` still applies). No side enum, no per-side
+  stored refs, same no-cache discipline (reports every change, never
+  dedupes).
 - `SplitSide`/`activeSplitSide` are removed; where a two-way name is still
-  needed during migration, prefer first/second-neutral spelling — the old
-  `.agent`/`.shell` cases become actively misleading at nested levels.
+  needed during migration, prefer first/second-neutral spelling.
+- `SplitLeafViewRegistry`: weak ID→view map populated in `onViewReady`,
+  parallel to `AttachViewRegistry`. Serves focus moves, focus restoration,
+  and the tracker resolver.
 
 ### 4. Menu commands (`HerdrMApp.swift`)
 
-- Split Vertically / Horizontally (⌘D / ⇧⌘D) operate on the *focused pane's
-  cell*: unsplit cell → split it in the pressed direction (nest); cell
-  already split with a *different* axis → re-aim it (flip — attach-safe,
-  and exactly today's depth-1 repeat behavior); cell already split with
-  the *same* axis → no-op. Rationale: same-direction re-split of the
-  focused pane would have to move its live attach down a level (identity
-  break, §2), so it is deliberately unavailable; further columns are built
-  by splitting siblings. Enabled whenever a tree or a selected entry exists.
+- Split Vertically / Horizontally (⌘D / ⇧⌘D): **always nest under the
+  focused pane** in the pressed direction. Uniform rule, no special cases:
+  with the pool strategy every nesting is identity-safe, so the depth-1
+  re-aim behavior (repeat press flips the axis) is intentionally replaced —
+  re-aiming is drag-only from here on. (Behavior change from today, called
+  out explicitly so it isn't mistaken for a regression.)
 - Focus arrows (⌘⌥ arrows): move keyboard focus to the *neighbor leaf* in
   that direction, computed from tree geometry. Always enabled while a tree
   exists; the 8-item per-axis workaround goes away — items no longer encode
   the axis, so the stale-shortcut class it worked around can't recur.
 - Resize (⌘⌃ arrows): grow/shrink the focused leaf's parent divider.
   Same enablement as focus.
-- ⌘W: close the focused leaf (terminal → close pane + collapse + focus the
-  surviving sibling; agent → collapse whole tree). With no tree, falls
-  through to today's split → shell → window chain.
+- ⌘W: close the focused leaf (terminal → close pane + prune + focus nearest
+  survivor; agent → collapse whole tree). With no tree, falls through to
+  today's split → shell → window chain.
 - Disabled-state staleness (the ⌘D lesson) is a hard rule, restated: no
   command may rely on `.disabled()` revalidation for shortcut-path
   correctness — actions no-op safely on unexpected focus, same guard style
@@ -198,8 +209,8 @@ attaches, so the recursion must not work that way):
   verified semantics of the existing single split.
 - No new RPCs. `focus: false` on creation everywhere, as today.
 - Divider ratios stay local (not propagated to the server). The two views
-  agree on split structure — except after a local re-aim (§4), which flips
-  only herdrm's axis while the server keeps the original direction. Full
+  agree on split structure — except after a local re-aim, which flips only
+  herdrm's axis while the server keeps the original direction. Full
   ratio/direction sync is a separate, explicitly deferred decision.
 
 ## Migration steps
@@ -209,49 +220,58 @@ attaches, so the recursion must not work that way):
    `isSplitPane`, leaf registry); reimplement `openSplit`/close paths on
    the tree for the depth-1 case. Keep `shellSplitAxis`/`splitTerminal` as
    computed shims during migration, remove at the end.
-2. `LeafCell` + `SplitTreeView` in `DetailView`; depth-1 tree must render
-   pixel-identical to today before proceeding — *including* attach
-   survival (no `--takeover` relaunch, scrollback intact, no focus steal;
-   verify via herdr-side: sibling attaches undisturbed).
+2. `SplitCanvasView` (pool + `layout()` + divider overlay) in `DetailView`;
+   depth-1 tree must render pixel-identical to today before proceeding —
+   *including* attach survival (no processkill, no `--takeover` relaunch,
+   scrollback intact, no focus steal; verify herdr-side that sibling shells
+   keep running).
 3. Focus tracker → leaf IDs (+ registry); menu rewritten
-   (split/focus/resize/⌘W) with the §4 repeat semantics.
-4. Depth-N enablement: split-focused-leaf path, collapse-all-descendants,
+   (split/focus/resize/⌘W) with the §4 always-nest semantics.
+4. Depth-N enablement: split-focused-leaf path, prune-with-descendant-close,
    focus restoration; 3-pane manual test including mixed directions.
 5. Delete shims (`shellSplitAxis`, `splitTerminal`, `SplitSide`,
-   `activeSplitSide`); full build + manual pass; squash.
+   `activeSplitSide`) and retire `SplitContainer` if unused; full build +
+   manual pass; squash.
 
 Each step keeps `make build` green and depth-1 behavior unchanged, so the
 work can land incrementally if preferred.
 
 ## Test plan (manual; no harness exists for AppKit focus paths)
 
-- [ ] Depth 1 unchanged: ⌘D/⇧⌘D, ⌘W, focus arrows, resize, takeover,
-      sidebar invisibility — same as today. Sibling attaches provably
-      undisturbed (no relaunch, scrollback intact).
+- [ ] Depth 1 unchanged (modulo the documented ⌘D-repeat change): ⌘D/⇧⌘D,
+      ⌘W, focus arrows, resize, takeover, sidebar invisibility — same as
+      today. Sibling attaches provably undisturbed (no relaunch, shell
+      keeps running server-side, scrollback intact).
 - [ ] Split a split terminal (⌘D with focus right): three panes, herdr TUI
-      shows the nested layout; closing the middle pane collapses correctly
-      and focuses the survivor — asserting the survivor's state explicitly:
-      attach relaunched (accepted, shell survives), scrollback re-synced,
-      keyboard on the survivor after the dust settles.
-- [ ] Mixed directions (vertical split inside a horizontal one and reverse).
-- [ ] ⌘W on each pane closes that pane (+focuses survivor); ⌘W on the agent
-      collapses all and closes every descendant pane server-side.
-- [ ] Repeat-press semantics: ⌘D on unsplit cell nests; opposite direction
-      re-aims; same direction on split cell no-ops.
+      shows the nested layout; closing the middle pane prunes correctly,
+      survivor keeps running with scrollback intact (no relaunch — assert
+      explicitly, this is the load-bearing invariant), keyboard on the
+      survivor.
+- [ ] Mixed directions (vertical split inside a horizontal one and reverse),
+      including same-direction nesting (three columns via two vertical
+      splits).
+- [ ] ⌘W on each pane closes that pane (+focuses nearest survivor); ⌘W on
+      the agent collapses all and closes every descendant pane server-side.
+- [ ] Repeat-press semantics: ⌘D always nests under focus; divider re-aim
+      is drag-only.
 - [ ] Rapid ⌘D⌘D / close-mid-open (including across two leaves): no orphaned
-      server panes (`herdr pane list` before/after).
+      server panes (`herdr pane list` before/after), no killed survivors
+      (`herdr pane get` on every surviving paneID).
 - [ ] Remote device: all of the above against an SSH device.
 
 ## Risks
 
+- The pool strategy trades view-hierarchy complexity for layout code: the
+  `layout()` function and divider overlay are new custom code (mitigation:
+  pure and unit-testable; divider math ports from `SplitContainer`).
 - Focus-tracking generalization is the fiddliest part (KVO on
   firstResponder + view-walk per change + new leaf registry); the current
   two-side tracker was already subtle. Mitigation: leaf-ID resolution is a
   pure function of the view hierarchy, covered by the same manual pass.
 - Menu shortcut staleness (the ⌘D lesson) recurs if new commands gate on
   `.disabled()` — noted as a hard rule in §4.
-- The per-pane-cell identity strategy (§2) is load-bearing for the whole
-  refactor: any deviation (moving an attach between structural positions)
-  relaunches processes. When in doubt, re-read `SplitContainer.swift:8-13`.
-- Scope creep into ratio sync / server-layout mirroring / same-direction
-  re-split — explicitly out; structure-only agreement is the contract.
+- The load-bearing invariant (§0/§2: never unmount a live pane) constrains
+  all future split UI work the way the root-container trick constrained the
+  single split. When in doubt, re-read `SplitContainer.swift:8-13` and §0.
+- Scope creep into ratio sync / server-layout mirroring — explicitly out;
+  structure-only agreement is the contract.
