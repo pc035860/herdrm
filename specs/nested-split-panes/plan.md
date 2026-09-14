@@ -20,6 +20,10 @@ concealment).
 - Same-direction re-split of an already-split cell (see §4): columns beyond
   two are built by splitting siblings, which covers realistic tiling; the
   residual gap is accepted MVP scope, not an oversight.
+- First-child collapse relaunches the survivor's attach *client* (see §2):
+  the shell session itself survives server-side; only the view flickers and
+  refocuses. Accepted MVP scope for the same reason — the mitigation (hosting
+  attach processes outside view identity) is a substantially larger change.
 
 ## Current state (what must change)
 
@@ -129,21 +133,35 @@ attaches, so the recursion must not work that way):
   `second()` (empty when unsplit — `SplitContainer` already skips
   divider+second on nil axis). Axis flips go through the existing
   `AnyLayout` mechanism, exactly like today's nil→split transition.
-- Consequence: an attach never changes structural position, at any depth.
-  Splits only ever *add* a `second()` sibling and flip one axis. No
-  conditional branch swaps around live attaches, at any level.
+- Consequence: an attach never changes structural position *on split*, at
+  any depth. Splits only ever *add* a `second()` sibling and flip one axis.
+  The one exception is first-child *collapse*: `split(first, second)` can only
+  collapse to `second` by promoting the survivor's cell one level up, which
+  remounts its attach (process terminated + `--takeover` re-attach + view
+  flicker; the shell session survives server-side). This is accepted scope
+  (see Non-goals): the close path sets `focusedSplitLeaf` to the survivor,
+  and the rebuilt attach self-focuses via `makeNSView`, so the "steal" lands
+  exactly where restoration wanted the keyboard anyway.
+- Structural invariant the mapping depends on: **every split node's first
+  child is always a leaf**, so the first-child leaf's cell renders that
+  node's container. It holds under all specified operations (splits replace
+  a leaf with `split(leaf, …)`; the §4 same-axis no-op prevents the
+  violation re-splitting would cause; collapse promotes a sibling whose own
+  first child is still a leaf) — which is also why the no-op rule and this
+  guarantee are two sides of the same coin, not coincidence.
 - New `SplitTreeView` maps the model tree to nested `LeafCell`s 1:1.
   `SplitContainer` itself is untouched. Focus dimming: the focused leaf
   renders full opacity, all others dimmed (today's `inactivePaneOpacity`).
 
 ### 3. Focus tracking (`TerminalView.swift`)
 
-- `SplitFocusTracker` reports a `SplitLeafID` instead of a side: replace
-  `isAgentView`/`shellView` with a single `(NSView) -> SplitLeafID?`
-  resolver supplied by the view layer (attach-registry hit → `.agent`;
-  otherwise walk up to the nearest pane container view carrying its leaf
-  ID). No side enum, no per-side stored refs, same no-cache discipline
-  (reports every change, never dedupes).
+- `SplitFocusTracker` reports a `SplitLeafID` instead of a side through a
+  single `(NSView) -> SplitLeafID?` resolver. The resolver consumes the same
+  `SplitLeafViewRegistry` the focus commands use (reverse lookup: is the
+  responder or an ancestor a registered leaf view?) — one source of truth
+  for leaf→view, instead of a separate view-tagging mechanism. No side enum,
+  no per-side stored refs, same no-cache discipline (reports every change,
+  never dedupes).
 - `SplitSide`/`activeSplitSide` are removed; where a two-way name is still
   needed during migration, prefer first/second-neutral spelling — the old
   `.agent`/`.shell` cases become actively misleading at nested levels.
@@ -180,8 +198,9 @@ attaches, so the recursion must not work that way):
   verified semantics of the existing single split.
 - No new RPCs. `focus: false` on creation everywhere, as today.
 - Divider ratios stay local (not propagated to the server). The two views
-  agree on structure, not proportions — same position as the current
-  split; full ratio sync is a separate, explicitly deferred decision.
+  agree on split structure — except after a local re-aim (§4), which flips
+  only herdrm's axis while the server keeps the original direction. Full
+  ratio/direction sync is a separate, explicitly deferred decision.
 
 ## Migration steps
 
@@ -211,7 +230,9 @@ work can land incrementally if preferred.
       undisturbed (no relaunch, scrollback intact).
 - [ ] Split a split terminal (⌘D with focus right): three panes, herdr TUI
       shows the nested layout; closing the middle pane collapses correctly
-      and focuses the survivor.
+      and focuses the survivor — asserting the survivor's state explicitly:
+      attach relaunched (accepted, shell survives), scrollback re-synced,
+      keyboard on the survivor after the dust settles.
 - [ ] Mixed directions (vertical split inside a horizontal one and reverse).
 - [ ] ⌘W on each pane closes that pane (+focuses survivor); ⌘W on the agent
       collapses all and closes every descendant pane server-side.
