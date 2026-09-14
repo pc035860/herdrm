@@ -267,25 +267,31 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Rebalances every divider so each leaf gets an equal share: a node's
-    /// ratio becomes first-leaf-count / total-leaf-count (NOT 0.5 — a nested
-    /// `split(A, split(B, C))` at all-0.5 renders 50/25/25). Also resets the
-    /// persisted root `splitRatio`, so the next depth-1 split starts even
-    /// instead of restoring a pre-balance drag position.
+    /// Rebalances every divider onto an even visual grid: a node's ratio is
+    /// its first child's span share (NOT raw leaf count — that equalizes
+    /// areas, so a stacked column like `split(H, B, C)` would take double
+    /// width). Along the split axis siblings add (side-by-side shares width);
+    /// across it they max (stacked leaves share one column's width). Also
+    /// resets the persisted root `splitRatio`, so the next depth-1 split
+    /// starts even instead of restoring a pre-balance drag position.
     func rebalanceSplits() {
-        func leafCount(_ node: SplitNode) -> Int {
+        // Width-shares when axis is .vertical, height-shares when .horizontal.
+        func span(_ node: SplitNode, along axis: SplitAxis) -> Int {
             switch node {
             case .leaf: return 1
-            case .split(_, _, let first, let second): return leafCount(first) + leafCount(second)
+            case .split(let nodeAxis, _, let first, let second) where nodeAxis == axis:
+                return span(first, along: axis) + span(second, along: axis)
+            case .split(_, _, let first, let second):
+                return max(span(first, along: axis), span(second, along: axis))
             }
         }
         func balanced(_ node: SplitNode) -> SplitNode {
             switch node {
             case .leaf: return node
             case .split(let axis, _, let first, let second):
-                let balancedFirst = balanced(first)
-                let total = leafCount(first) + leafCount(second)
-                return .split(axis: axis, ratio: Double(leafCount(first)) / Double(total), first: balancedFirst, second: balanced(second))
+                let firstSpan = span(first, along: axis)
+                let total = firstSpan + span(second, along: axis)
+                return .split(axis: axis, ratio: Double(firstSpan) / Double(total), first: balanced(first), second: balanced(second))
             }
         }
         splitRatio = 0.5
