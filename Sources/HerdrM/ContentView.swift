@@ -266,20 +266,20 @@ struct DetailView: View {
                 .zIndex(1)
             Rectangle().fill(Theme.hairline).frame(height: 1)
             detailContent
-                // Losing the selected agent tears the SplitContainer down without
-                // resetting the axis, which would leave the same phantom split.
+                // Losing the selected agent must collapse the tree: without this
+                // the split would outlive its agent — a phantom split the next ⌘W
+                // would "close" instead of the window, and a deferred focus request
+                // could arm into a tree with nothing left to consume it.
                 //
-                // Load-bearing beyond that: this is the ONLY thing that clears the axis
-                // when the agent goes away. `dismantleNSView` nils the coordinator's
-                // onExit before killing the shell, so the shell's own onExit never fires
-                // on teardown. Remove this and "split open with no agent selected"
-                // becomes reachable, which is a state a deferred focus request can be
-                // armed into with nothing left in the tree to consume it.
+                // Load-bearing beyond that: this is the ONLY thing that collapses
+                // the tree when the agent goes away. `dismantleNSView` nils the
+                // coordinator's onExit before killing the shell, so the shell's
+                // own onExit never fires on teardown.
                 .onChange(of: model.selectedAttachedEntry?.id) { _, id in
                     if id == nil {
-                        model.shellSplitAxis = nil
+                        model.collapseSplitTree()
                         // The placeholder tore every kept-alive attach down along with
-                        // the SplitContainer. Empty the session list and per-entry state
+                        // the canvas. Empty the session list and per-entry state
                         // so a later selection doesn't resurrect them all at once.
                         model.attachSessions = []
                         endedAttach = [:]
@@ -670,12 +670,12 @@ struct DetailView: View {
                 else { return }
                 focusTerminal(model.splitAgentView)
             }
-            // Splitting moves the keyboard to the shell, so closing the split has to
-            // hand it back — by ⌘W or by the shell exiting on its own. Reset the
-            // tracked side to the agent so the next split starts predictably.
-            .onChange(of: model.shellSplitAxis) { _, axis in
-                if axis == nil {
-                    model.activeSplitSide = .agent
+            // Splitting moves the keyboard to the new pane, so the tree going
+            // away has to hand it back — by ⌘W, by the last leaf closing, or
+            // by selection loss. Reset focus state so the next split starts
+            // predictably.
+            .onChange(of: model.splitTree) { _, tree in
+                if tree == nil {
                     model.pendingSplitAgentFocus = false
                     focusRemainingTerminal(preferring: model.splitAgentView)
                 }

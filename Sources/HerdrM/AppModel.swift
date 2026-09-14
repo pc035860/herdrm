@@ -59,10 +59,6 @@ struct SSHAuthenticationRequest: Identifiable {
 /// vertical = panes side by side with a vertical divider (iTerm2's convention).
 enum SplitAxis { case vertical, horizontal }
 
-/// Identifies one of the two panes in the ⌘D split. Used for focus tracking and
-/// keyboard-driven resize.
-enum SplitSide { case agent, shell }
-
 /// A standalone local or SSH shell shown as its own sidebar entry — app-owned,
 /// outside any herdr space (unlike the persistent herdr terminals under
 /// TERMINALS) and not the ⌘D split.
@@ -150,16 +146,6 @@ final class AppModel: ObservableObject {
     @Published var showNewSpace = false
     @Published var showSearch = false
     @Published var isFileManagerActive = false
-    @Published var shellSplitAxis: SplitAxis? {
-        // Every path that clears the axis (⌘W, selection loss, attach exit)
-        // funnels the server-side cleanup through here, so the split pane
-        // can never be stranded in the workspace.
-        didSet {
-            if oldValue != nil, shellSplitAxis == nil {
-                closeSplitTerminal()
-            }
-        }
-    }
     /// One split pane: a real server-side terminal pane owned by the split
     /// (renamed from SplitTerminal — leaves are panes now, terminals attach
     /// to them). Ephemeral by design: closing the split closes the pane.
@@ -188,15 +174,11 @@ final class AppModel: ObservableObject {
         case split(axis: SplitAxis, ratio: Double, first: SplitNode, second: SplitNode)
     }
     /// The split tree. Nil == no split. Source of truth from step 1 on;
-    /// the `shellSplitAxis`/`splitTerminal` shims below mirror it until the
-    /// canvas (step 2) and menu (step 3) read the tree directly.
+    /// the tree directly (canvas, menu, concealment).
     @Published var splitTree: SplitNode?
     /// The leaf holding the keyboard. Default `.agent`; wired to the focus
     /// tracker in step 3 (until then the agent leaf is always the focus).
     @Published var focusedSplitLeaf: SplitLeafID = .agent
-    /// Shim for the step-2 rendering, which still reads this. Mirrors the
-    /// tree's newest terminal leaf at depth 1; cleared with the tree.
-    @Published var splitTerminal: SplitPane?
     /// Pane IDs concealed from the sidebar, search, and auto-selection while
     /// the split owns them. Inserted right after `pane.split` (before the first
     /// refresh can publish the new pane) and removed once the tree takes
@@ -316,7 +298,6 @@ final class AppModel: ObservableObject {
     @Published var pendingSplitAgentFocus = false
     /// The pane that currently holds the keyboard within the ⌘D split. Reset to
     /// the agent side whenever the split closes so reopening it is predictable.
-    @Published var activeSplitSide: SplitSide = .agent
     /// Persisted divider ratio for the ⌘D split, shared with the resize commands.
     /// Deliberately not `@AppStorage`: that publishes only from inside a View, so the
     /// menu commands would write UserDefaults without ever redrawing the split.
@@ -326,10 +307,10 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(splitRatio, forKey: AppModel.splitRatioKey) }
     }
     static let splitRatioKey = "terminal.splitRatio"
-    /// Live terminal views of the ⌘D split, used by menu commands to move focus.
-    /// The agent side is resolved from the attach registry by the current selection
-    /// (kept-alive attach views persist across switches, so a stored ref would go
-    /// stale); the shell side stays a weak ref since the split shell is a single view.
+    /// Live terminal views, used by menu commands to move focus. The agent side
+    /// resolves from the attach registry by current selection (kept-alive attach
+    /// views persist across switches, so a stored ref would go stale); split
+    /// shells stay weak refs (a dismantle must never extend a dying view).
     var splitAgentView: LineBreakTerminalView? {
         selectedAttachedEntry.flatMap { AttachViewRegistry.view(for: $0.id) }
     }
@@ -734,7 +715,7 @@ final class AppModel: ObservableObject {
         // and a later unrelated activation would cash it in, pulling the keyboard out of
         // the shell. Those clicks get focus from the recreated attach and from the
         // entry-change request instead.
-        if shellSplitAxis != nil, showSearch { pendingSplitAgentFocus = true }
+        if splitTree != nil, showSearch { pendingSplitAgentFocus = true }
     }
 
     // MARK: - Shell terminals
@@ -814,8 +795,6 @@ final class AppModel: ObservableObject {
                     self?.updateSplitTree { tree in
                         tree = .split(axis: axis, ratio: self?.splitRatio ?? 0.5, first: .leaf(.agent), second: .leaf(.terminal(newPane)))
                     }
-                    self?.splitTerminal = newPane
-                    self?.shellSplitAxis = axis
                 }
             )
             return
@@ -848,8 +827,6 @@ final class AppModel: ObservableObject {
                         guard let current = tree else { return }
                         tree = Self.nest(current, leaf: .agent, axis: axis, newPane: newPane)
                     }
-                    self?.splitTerminal = newPane
-                    if self?.shellSplitAxis == nil { self?.shellSplitAxis = axis }
                 }
             )
         case .pane(let deviceID, let paneID):
@@ -871,8 +848,6 @@ final class AppModel: ObservableObject {
                         guard let current = tree else { return }
                         tree = Self.nest(current, leaf: leafID, axis: axis, newPane: newPane)
                     }
-                    self?.splitTerminal = newPane
-                    if self?.shellSplitAxis == nil { self?.shellSplitAxis = axis }
                 }
             )
         }
@@ -974,22 +949,24 @@ final class AppModel: ObservableObject {
     /// end state. Deliberately still closes on takeover — an ephemeral pane
     /// has no second life outside the split, so collapsing without closing
     /// would strand it with no UI left to reach it (it is hidden everywhere).
-    private func closeSplitTerminal() {
+    /// Collapses the whole split tree, closing every split pane. Every path
+    /// that ends the split (⌘W on the agent leaf, selection loss) funnels the
+    /// server-side cleanup through here, so split panes can never be stranded
+    /// in the workspace.
+    func collapseSplitTree() {
         splitOpenTasks.values.forEach { $0.cancel() }
         splitOpenTasks.removeAll()
         guard splitTree != nil else { return }
         let doomed = terminalSplitPanes()
         coverKeys(for: doomed)
         updateSplitTree { $0 = nil }
-        splitTerminal = nil
         focusedSplitLeaf = .agent
-        activeSplitSide = .agent
         spawnSplitPaneCloser(doomed)
     }
 
     /// Prunes one terminal leaf: collapses its parent to the surviving sibling
-    /// and closes the leaf's pane. Agent-leaf close goes through the
-    /// `shellSplitAxis = nil` funnel (whole-tree collapse above), not here.
+    /// and closes the leaf's pane. Agent-leaf close goes through
+    /// `collapseSplitTree()` (whole-tree collapse above), not here.
     /// Focus follows the nearest surviving leaf; pruning the last terminal
     /// leaf clears the tree (no split left to show).
     func closeSplitLeaf(_ id: SplitLeafID) {
@@ -1006,10 +983,7 @@ final class AppModel: ObservableObject {
         } else {
             // Last terminal leaf gone: nothing left to split around.
             updateSplitTree { $0 = nil }
-            splitTerminal = nil
-            shellSplitAxis = nil // didSet → closeSplitTerminal → tree nil → no-op
             focusedSplitLeaf = .agent
-            activeSplitSide = .agent
         }
         spawnSplitPaneCloser([pruned.removed])
     }

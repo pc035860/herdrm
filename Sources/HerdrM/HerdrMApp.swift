@@ -29,12 +29,9 @@ private struct AppModelFocusedValueKey: FocusedValueKey {
     typealias Value = AppModel
 }
 
-/// The split axis travels as its own focused value, not read off the model. `Commands`
-/// gets the AppModel by reference and never subscribes to its objectWillChange, so
-/// `focusedModel?.shellSplitAxis` was evaluated once and stuck: the menu items stayed
-/// disabled with a split open, and a disabled NSMenuItem does not fire its key
 /// Commands read the model straight through `focusedModel`, so no other
-/// focused values are needed.
+/// focused values are needed. (An earlier revision carried the split axis as
+/// its own focused value; directional commands made it obsolete.)
 extension FocusedValues {
     var appModel: AppModel? {
         get { self[AppModelFocusedValueKey.self] }
@@ -174,7 +171,7 @@ struct HerdrMApp: App {
                             model.closeSplitLeaf(.pane(deviceID: deviceID, paneID: paneID))
                             model.focusSplitLeaf(model.focusedSplitLeaf)
                         case .agent:
-                            model.shellSplitAxis = nil
+                            model.collapseSplitTree()
                         }
                     } else if let model = focusedModel, let shell = model.selectedShell {
                         model.closeShellSession(shell.id)

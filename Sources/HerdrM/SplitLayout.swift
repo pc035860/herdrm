@@ -1,7 +1,7 @@
 import CoreGraphics
 import SwiftUI
 
-/// Clamp shared by the canvas and (until step 5) SplitContainer: dividers live
+/// Clamp shared by the canvas (and formerly SplitContainer): dividers live
 /// in 0.2...0.8 so neither pane can be dragged out of existence.
 enum SplitContainerRatioBounds {
     static let bounds = 0.2...0.8
