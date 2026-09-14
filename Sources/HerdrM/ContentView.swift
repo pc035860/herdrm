@@ -565,7 +565,12 @@ struct DetailView: View {
             dark: colorScheme == .dark,
             mouseReporting: terminalMouseReporting,
             onAttachmentError: { model.actionError = $0 },
-            onExit: { _ in model.shellSplitAxis = nil },
+            // A pooled pane dying (takeover, closed elsewhere) prunes just its
+            // leaf — never the whole-tree funnel, which would nuke live siblings.
+            onExit: { [weak model] _ in
+                model?.closeSplitLeaf(.pane(deviceID: pane.device.id, paneID: pane.paneID))
+                if let model { model.focusSplitLeaf(model.focusedSplitLeaf) }
+            },
             onViewReady: {
                 SplitLeafViewRegistry.register($0, for: .pane(deviceID: pane.device.id, paneID: pane.paneID))
                 model.splitShellView = $0
