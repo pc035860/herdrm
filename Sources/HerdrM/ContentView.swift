@@ -50,7 +50,7 @@ struct RootView: View {
                 .hidden()
         )
         .focusedSceneValue(\.appModel, model)
-        .focusedSceneValue(\.splitAxis, model.shellSplitAxis)
+        .focusedSceneValue(\.splitTree, model.splitTree)
         .sheet(isPresented: $model.showSearch) { SearchSheet(model: model) }
         .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: 980, minHeight: 620)
@@ -267,20 +267,20 @@ struct DetailView: View {
                 .zIndex(1)
             Rectangle().fill(Theme.hairline).frame(height: 1)
             detailContent
-                // Losing the selected agent tears the SplitContainer down without
-                // resetting the axis, which would leave the same phantom split.
+                // Losing the selected agent must collapse the tree: without this
+                // the split would outlive its agent — a phantom split the next ⌘W
+                // would "close" instead of the window, and a deferred focus request
+                // could arm into a tree with nothing left to consume it.
                 //
-                // Load-bearing beyond that: this is the ONLY thing that clears the axis
-                // when the agent goes away. `dismantleNSView` nils the coordinator's
-                // onExit before killing the shell, so the shell's own onExit never fires
-                // on teardown. Remove this and "split open with no agent selected"
-                // becomes reachable, which is a state a deferred focus request can be
-                // armed into with nothing left in the tree to consume it.
+                // Load-bearing beyond that: this is the ONLY thing that collapses
+                // the tree when the agent goes away. `dismantleNSView` nils the
+                // coordinator's onExit before killing the shell, so the shell's
+                // own onExit never fires on teardown.
                 .onChange(of: model.selectedAttachedEntry?.id) { _, id in
                     if id == nil {
-                        model.shellSplitAxis = nil
+                        model.collapseSplitTree()
                         // The placeholder tore every kept-alive attach down along with
-                        // the SplitContainer. Empty the session list and per-entry state
+                        // the canvas. Empty the session list and per-entry state
                         // so a later selection doesn't resurrect them all at once.
                         model.attachSessions = []
                         endedAttach = [:]
@@ -490,53 +490,150 @@ struct DetailView: View {
     }
 
     @ViewBuilder
-    private var attachedTerminal: some View {
-        if let entry = model.selectedAttachedEntry {
-            SplitContainer(
-                axis: model.shellSplitAxis,
-                activeSide: model.activeSplitSide,
-                ratio: $model.splitRatio
-            ) {
-                // One structural position holding every kept-alive attach. Each child
-                // keeps a stable identity and is toggled by opacity, so switching the
-                // selection — or opening/closing the split — never tears a terminal
-                // down: its content survives the round trip. Do not key this on the
-                // selection; that rebuild-on-switch is exactly what this removes.
-                ZStack {
-                    ForEach(model.attachSessions) { session in
-                        attachChild(session, isSelected: session.id == entry.id)
+    /// The split canvas: every live attach mounted exactly once in a flat pool
+    /// (agent stack + split terminals), positioned by the tree's pure geometry.
+    /// Splits, collapses, and resizes only ever change rects \u2014 a live pane's
+    /// view is never moved or rebuilt, so its process survives every layout
+    /// change (a dismantle would kill the server pane). Depth 1 renders
+    /// pixel-identical to the old SplitContainer: same padding, backdrop,
+    /// divider, and dimming.
+    private func splitCanvas(entry: AppModel.AttachedEntry) -> some View {
+        GeometryReader { proxy in
+            let layout = splitLayout(
+                model.splitTree,
+                in: CGRect(origin: .zero, size: proxy.size)
+            )
+            ZStack(alignment: .topLeading) {
+                if let agentRect = layout.leaves[.agent] {
+                    // One structural position holding every kept-alive attach. Each child
+                    // keeps a stable identity and is toggled by opacity, so switching the
+                    // selection never tears a terminal down: its content survives the
+                    // round trip. Do not key this on the selection; that rebuild-on-switch
+                    // is exactly what this removes.
+                    ZStack {
+                        ForEach(model.attachSessions) { session in
+                            attachChild(session, isSelected: session.id == entry.id)
+                        }
+                    }
+                    .frame(width: agentRect.width, height: agentRect.height)
+                    .position(x: agentRect.midX, y: agentRect.midY)
+                    .opacity(canvasOpacity(for: .agent))
+                }
+                ForEach(model.poolSplitPanes(), id: \.poolID) { pane in
+                    if let rect = layout.leaves[.pane(deviceID: pane.device.id, paneID: pane.paneID)] {
+                        splitPoolChild(pane)
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
+                            .opacity(canvasOpacity(for: .pane(deviceID: pane.device.id, paneID: pane.paneID)))
                     }
                 }
-            } second: {
-                // The split is a real herdr pane in the agent's workspace (same
-                // device), attached like any terminal — not a local shell. It is
-                // created by openSplit and closed when the axis clears; the id
-                // keys the attach to its pane so a new split rebuilds cleanly.
-                if let split = model.splitTerminal {
-                    AttachTerminalView(
-                        device: split.device,
-                        target: split.target,
-                        serverVersion: model.serverVersion(deviceID: split.device.id),
-                        attachmentCapabilities: nil,
-                        fontName: terminalFontName,
-                        fontSize: terminalFontSize,
-                        thinStrokes: terminalThinStrokes,
-                        fontWeight: terminalFontWeight,
-                        lineSpacing: terminalLineSpacing,
-                        dark: colorScheme == .dark,
-                        mouseReporting: terminalMouseReporting,
-                        onAttachmentError: { model.actionError = $0 },
-                        onExit: { _ in model.shellSplitAxis = nil },
-                        onViewReady: {
-                            splitTracker.shellView = $0
-                            model.splitShellView = $0
-                        }
+                ForEach(layout.dividers) { divider in
+                    SplitCanvasDivider(
+                        axis: divider.axis,
+                        ratio: divider.ratio,
+                        total: divider.extent,
+                        onDrag: { model.setSplitRatio($0, at: divider.path) }
                     )
-                    .id("split-\(split.paneID)")
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
+                    .frame(width: divider.rect.width, height: divider.rect.height)
+                    .position(x: divider.rect.midX, y: divider.rect.midY)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func canvasOpacity(for leaf: AppModel.SplitLeafID) -> Double {
+        guard model.splitTree != nil else { return 1.0 }
+        return model.focusedSplitLeaf == leaf ? 1.0 : inactivePaneOpacity
+    }
+
+    /// One pooled split terminal: a real herdr pane in the agent's workspace
+    /// (same device), attached like any terminal \u2014 not a local shell. The id
+    /// keys the attach to its pane so a new split rebuilds cleanly; the pool
+    /// (keyed by `poolID`) keeps it mounted until its pane closes.
+    @ViewBuilder
+    private func splitPoolChild(_ pane: AppModel.SplitPane) -> some View {
+        AttachTerminalView(
+            device: pane.device,
+            target: pane.target,
+            serverVersion: model.serverVersion(deviceID: pane.device.id),
+            attachmentCapabilities: nil,
+            fontName: terminalFontName,
+            fontSize: terminalFontSize,
+            thinStrokes: terminalThinStrokes,
+            fontWeight: terminalFontWeight,
+            lineSpacing: terminalLineSpacing,
+            dark: colorScheme == .dark,
+            mouseReporting: terminalMouseReporting,
+            onAttachmentError: { model.actionError = $0 },
+            // A pooled pane dying (takeover, closed elsewhere) prunes just its
+            // leaf — never the whole-tree funnel, which would nuke live siblings.
+            onExit: { [weak model] _ in
+                model?.closeSplitLeaf(.pane(deviceID: pane.device.id, paneID: pane.paneID))
+                if let model { model.focusSplitLeaf(model.focusedSplitLeaf) }
+            },
+            onViewReady: {
+                SplitLeafViewRegistry.register($0, for: .pane(deviceID: pane.device.id, paneID: pane.paneID))
+                model.splitShellView = $0
+            }
+        )
+        .id("split-\(pane.paneID)")
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        // Same solid-backdrop treatment as attachChild: Ghostty's non-opaque
+        // Metal layer needs an opaque background inside the compositing group
+        // or glyph AA renders pale.
+        .background(Theme.terminalBackground)
+    }
+
+    /// One canvas divider: the SplitContainer look (1pt hairline + 7pt grab
+    /// strip + resize cursor), writing drag ratios back to the tree node at
+    /// the divider's path. Positioned absolutely by the layout pass.
+    private struct SplitCanvasDivider: View {
+        let axis: SplitAxis
+        let ratio: Double
+        let total: CGFloat
+        let onDrag: (Double) -> Void
+
+        @State private var dragStartRatio: Double?
+
+        var body: some View {
+            Rectangle()
+                .fill(Theme.hairline)
+                .frame(width: axis == .vertical ? 1 : nil, height: axis == .horizontal ? 1 : nil)
+                .overlay(
+                    Rectangle()
+                        .fill(.clear)
+                        .frame(width: axis == .vertical ? 7 : nil, height: axis == .horizontal ? 7 : nil)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture()
+                                .onChanged { value in
+                                    guard total > 0 else { return }
+                                    let start = dragStartRatio ?? SplitContainerRatioBounds.clamp(ratio)
+                                    if dragStartRatio == nil { dragStartRatio = start }
+                                    let travelled = axis == .vertical
+                                        ? value.translation.width
+                                        : value.translation.height
+                                    onDrag(start + travelled / total)
+                                }
+                                .onEnded { _ in dragStartRatio = nil }
+                        )
+                        .onHover { hovering in
+                            if hovering {
+                                (axis == .vertical ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).set()
+                            } else {
+                                NSCursor.arrow.set()
+                            }
+                        }
+                )
+        }
+    }
+
+    @ViewBuilder
+    private var attachedTerminal: some View {
+        if let entry = model.selectedAttachedEntry {
+            splitCanvas(entry: entry)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Theme.terminalBackground)
             .overlay(alignment: .bottomTrailing) {
@@ -545,9 +642,14 @@ struct DetailView: View {
             .onAppear {
                 // Single source of truth: the tracker writes straight into the model
                 // instead of holding its own copy for a second onChange to mirror.
-                splitTracker.onSideChanged = { model.activeSplitSide = $0 }
-                splitTracker.isAgentView = { view in
-                    AttachViewRegistry.liveViews.contains { $0 === view }
+                splitTracker.onLeafChanged = { model.focusedSplitLeaf = $0 }
+                splitTracker.resolveLeaf = { view in
+                    // The agent side first: its stack is selection-dependent, so
+                    // it has no registry entry (see SplitFocusTracker's note).
+                    if AttachViewRegistry.liveViews.contains(where: { $0 === view || view.isDescendant(of: $0) }) {
+                        return .agent
+                    }
+                    return SplitLeafViewRegistry.leaf(containing: view)
                 }
                 splitTracker.start()
             }
@@ -571,12 +673,12 @@ struct DetailView: View {
                 else { return }
                 focusTerminal(model.splitAgentView)
             }
-            // Splitting moves the keyboard to the shell, so closing the split has to
-            // hand it back — by ⌘W or by the shell exiting on its own. Reset the
-            // tracked side to the agent so the next split starts predictably.
-            .onChange(of: model.shellSplitAxis) { _, axis in
-                if axis == nil {
-                    model.activeSplitSide = .agent
+            // Splitting moves the keyboard to the new pane, so the tree going
+            // away has to hand it back — by ⌘W, by the last leaf closing, or
+            // by selection loss. Reset focus state so the next split starts
+            // predictably.
+            .onChange(of: model.splitTree) { _, tree in
+                if tree == nil {
                     model.pendingSplitAgentFocus = false
                     focusRemainingTerminal(preferring: model.splitAgentView)
                 }
