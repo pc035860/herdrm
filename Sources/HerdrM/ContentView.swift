@@ -51,6 +51,7 @@ struct RootView: View {
         )
         .focusedSceneValue(\.appModel, model)
         .focusedSceneValue(\.splitTree, model.splitTree)
+        .focusedSceneValue(\.splitTreeActive, model.isSplitActive)
         .sheet(isPresented: $model.showSearch) { SearchSheet(model: model) }
         .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: 980, minHeight: 620)
@@ -503,8 +504,15 @@ struct DetailView: View {
                 model.splitTree,
                 in: CGRect(origin: .zero, size: proxy.size)
             )
+            // Pinned to the owner's tab: a foreign selection suspends the
+            // split (selected entry fullscreen, pool mounted but hidden so
+            // the attaches survive) instead of recomposing col1 around the
+            // selection like a herdr tab never would.
+            let active = model.isSplitActive
+            let fullRect = CGRect(origin: .zero, size: proxy.size)
             ZStack(alignment: .topLeading) {
                 if let agentRect = layout.leaves[.agent] {
+                    let rect = active ? agentRect : fullRect
                     // One structural position holding every kept-alive attach. Each child
                     // keeps a stable identity and is toggled by opacity, so switching the
                     // selection never tears a terminal down: its content survives the
@@ -515,27 +523,30 @@ struct DetailView: View {
                             attachChild(session, isSelected: session.id == entry.id)
                         }
                     }
-                    .frame(width: agentRect.width, height: agentRect.height)
-                    .position(x: agentRect.midX, y: agentRect.midY)
-                    .opacity(canvasOpacity(for: .agent))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                    .opacity(active ? canvasOpacity(for: .agent) : 1.0)
                 }
                 ForEach(model.poolSplitPanes(), id: \.poolID) { pane in
                     if let rect = layout.leaves[.pane(deviceID: pane.device.id, paneID: pane.paneID)] {
                         splitPoolChild(pane)
                             .frame(width: rect.width, height: rect.height)
                             .position(x: rect.midX, y: rect.midY)
-                            .opacity(canvasOpacity(for: .pane(deviceID: pane.device.id, paneID: pane.paneID)))
+                            .opacity(active ? canvasOpacity(for: .pane(deviceID: pane.device.id, paneID: pane.paneID)) : 0)
+                            .allowsHitTesting(active)
                     }
                 }
-                ForEach(layout.dividers) { divider in
-                    SplitCanvasDivider(
-                        axis: divider.axis,
-                        ratio: divider.ratio,
-                        total: divider.extent,
-                        onDrag: { model.setSplitRatio($0, at: divider.path) }
-                    )
-                    .frame(width: divider.rect.width, height: divider.rect.height)
-                    .position(x: divider.rect.midX, y: divider.rect.midY)
+                if active {
+                    ForEach(layout.dividers) { divider in
+                        SplitCanvasDivider(
+                            axis: divider.axis,
+                            ratio: divider.ratio,
+                            total: divider.extent,
+                            onDrag: { model.setSplitRatio($0, at: divider.path) }
+                        )
+                        .frame(width: divider.rect.width, height: divider.rect.height)
+                        .position(x: divider.rect.midX, y: divider.rect.midY)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -568,9 +579,11 @@ struct DetailView: View {
             onAttachmentError: { model.actionError = $0 },
             // A pooled pane dying (takeover, closed elsewhere) prunes just its
             // leaf — never the whole-tree funnel, which would nuke live siblings.
+            // Focus follows only when showing: while suspended the keyboard
+            // stays where the selection put it.
             onExit: { [weak model] _ in
                 model?.closeSplitLeaf(.pane(deviceID: pane.device.id, paneID: pane.paneID))
-                if let model { model.focusSplitLeaf(model.focusedSplitLeaf) }
+                if let model, model.isSplitActive { model.focusSplitLeaf(model.focusedSplitLeaf) }
             },
             onViewReady: {
                 SplitLeafViewRegistry.register($0, for: .pane(deviceID: pane.device.id, paneID: pane.paneID))
@@ -672,6 +685,14 @@ struct DetailView: View {
                       window === model.splitAgentView?.window
                 else { return }
                 focusTerminal(model.splitAgentView)
+            }
+            // Resuming the owner's tab hands the keyboard back to the leaf
+            // that held it (suspending never touched focus — the selection's
+            // own handoff put it on the foreign entry).
+            .onChange(of: model.isSplitActive) { _, active in
+                if active {
+                    model.focusSplitLeaf(model.focusedSplitLeaf)
+                }
             }
             // Splitting moves the keyboard to the new pane, so the tree going
             // away has to hand it back — by ⌘W, by the last leaf closing, or

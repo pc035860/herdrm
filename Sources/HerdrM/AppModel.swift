@@ -282,6 +282,7 @@ final class AppModel: ObservableObject {
     /// resets the persisted root `splitRatio`, so the next depth-1 split
     /// starts even instead of restoring a pre-balance drag position.
     func rebalanceSplits() {
+        guard isSplitActive else { return }
         // Width-shares when axis is .vertical, height-shares when .horizontal.
         func span(_ node: SplitNode, along axis: SplitAxis) -> Int {
             switch node {
@@ -353,11 +354,27 @@ final class AppModel: ObservableObject {
     }
 
     /// Who the live tree belongs to: the entry selected at creation. The
-    /// agent leaf renders the *selected* entry, so restoring under a
-    /// different selection would show the splits over the wrong agent — the
-    /// restore gate matches this (or a snapshot pane) before adopting.
-    /// In-memory only; the persisted snapshot carries its own copy.
+    /// split is pinned to this tab — selecting elsewhere suspends (hides)
+    /// the split instead of recomposing it, and the restore gate adopts only
+    /// inside the family. In-memory only; the persisted snapshot carries its
+    /// own copy.
     private var splitTreeOwner: (paneID: String, isAgent: Bool)?
+    /// The owner's entry ID ("agent-<uuid>-<pane>" / "terminal-<uuid>-<pane>",
+    /// same shape as `AttachedEntry.id`), or nil with no tree/owner.
+    var splitOwnerEntryID: String? {
+        guard splitTree != nil, let owner = splitTreeOwner, let device = treeDevice() else { return nil }
+        return "\(owner.isAgent ? "agent" : "terminal")-\(device.id.uuidString)-\(owner.paneID)"
+    }
+    /// Whether the split is showing: a split is pinned to its owner's tab
+    /// like a herdr tab, NOT following sidebar selection. While suspended
+    /// (tree live, selection elsewhere) the pool stays mounted but hidden —
+    /// unmounting would tear down the attaches — and every split action
+    /// no-ops except server-side prune (a pane dying while suspended still
+    /// leaves the tree correctly).
+    var isSplitActive: Bool {
+        guard let ownerID = splitOwnerEntryID else { return false }
+        return selectedAttachedEntry?.id == ownerID
+    }
     /// Snapshot waiting for its device data + selection to line up. Loaded
     /// once at launch; cleared on successful restore or when the owner pane
     /// is confirmed gone. Never retried after a deterministic failure, so
@@ -1140,6 +1157,9 @@ final class AppModel: ObservableObject {
     /// pane auto-focuses on mount (makeNSView), so repeats drill deeper and the
     /// tracker follows focus onto the new leaf by itself.
     func openSplit(axis: SplitAxis) {
+        // A suspended tree belongs to another tab: ⌘D must not nest into
+        // panes the user can't see. (Treeless always creates.)
+        guard splitTree == nil || isSplitActive else { return }
         if splitTree == nil {
             // Root creation from the agent side.
             guard focusedSplitLeaf == .agent,
@@ -1325,6 +1345,11 @@ final class AppModel: ObservableObject {
     /// the split, so collapsing without closing would strand it with no UI left
     /// to reach it (it is hidden everywhere).
     func collapseSplitTree() {
+        // Dismissing another tab's suspended split would nuke live panes the
+        // user can't even see — only the active tab collapses itself. The
+        // selectionless teardown (nothing showing, nothing to surprise) is
+        // the one exception.
+        guard isSplitActive || selectedAttachedEntry == nil else { return }
         splitOpenTasks.values.forEach { $0.cancel() }
         splitOpenTasks.removeAll()
         guard splitTree != nil else { return }
@@ -1568,6 +1593,8 @@ final class AppModel: ObservableObject {
     /// keyboard in the wrong place. The tracker's KVO report is the source of
     /// truth for `focusedSplitLeaf`; this only moves the responder.
     func focusSplitLeaf(_ id: SplitLeafID) {
+        // Never land the keyboard in a suspended (hidden) tree.
+        guard isSplitActive else { return }
         let view: NSView? = SplitLeafViewRegistry.view(for: id)
             ?? (id == .agent ? splitAgentView : nil)
         guard let view, let window = view.window else { return }
@@ -1589,8 +1616,10 @@ final class AppModel: ObservableObject {
     /// Nudges the focused leaf's nearest same-direction ancestor divider by 5%
     /// toward the pressed arrow. No-op when no such divider exists (leaf edge
     /// facing the other axis) — safe by the ⌘D lesson: never gate on
-    /// `.disabled()`, just do nothing on unexpected focus.
+    /// `.disabled()`, just do nothing on unexpected focus. Also no-ops while
+    /// suspended — nudging panes the user can't see would be spooky action.
     func nudgeFocusedLeaf(arrow: SplitDirection) {
+        guard isSplitActive else { return }
         guard splitTree != nil, let path = leafPath(focusedSplitLeaf) else { return }
         let wantAxis: SplitAxis = (arrow == .left || arrow == .right) ? .vertical : .horizontal
         // Nearest ancestor split (node path + taken index) with a matching axis.
