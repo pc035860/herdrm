@@ -793,10 +793,7 @@ final class AppModel: ObservableObject {
                 install: { [weak self] newPane in
                     // Root creation seeds the persisted ratio (the user's dragged
                     // position survives, as today); deeper nodes seed 0.5.
-                    // Guarded: a collapse racing the final hop must not resurrect
-                    // a tree whose pane the closer is concurrently shutting.
                     self?.updateSplitTree { tree in
-                        guard tree == nil else { return }
                         tree = .split(axis: axis, ratio: self?.splitRatio ?? 0.5, first: .leaf(.agent), second: .leaf(.terminal(newPane)))
                     }
                 }
@@ -929,9 +926,10 @@ final class AppModel: ObservableObject {
                 terminal = terminalEntries(for: device).first(where: { $0.pane.paneID == paneID })
                 if terminal != nil { break }
             }
-            guard stillWanted(), let terminal else {
-                // The leaf moved on mid-flight, or the new pane never appeared:
-                // don't strand (or surface) a pane nobody asked for.
+            guard stillWanted(), let terminal, !Task.isCancelled else {
+                // The leaf moved on mid-flight, the new pane never appeared, or
+                // a collapse cancelled the task after the last retry check:
+                // don't strand (or surface, or resurrect) a pane nobody asked for.
                 try? await service(for: device).closePane(paneID: paneID)
                 await refresh(device.id)
                 if terminal == nil {

@@ -29,9 +29,6 @@ private struct AppModelFocusedValueKey: FocusedValueKey {
     typealias Value = AppModel
 }
 
-/// Commands read the model straight through `focusedModel`, so no other
-/// focused values are needed. (An earlier revision carried the split axis as
-/// its own focused value; directional commands made it obsolete.)
 /// The split tree travels as its own focused value, not read off the model.
 /// `Commands` gets the AppModel by reference and never subscribes to its
 /// objectWillChange, so reading tree state off `focusedModel` evaluates once
@@ -206,6 +203,10 @@ struct HerdrMApp: App {
 
     private var closeButtonTitle: String {
         if focusedSplitTree != nil { return String(localized: "Close Split Pane") }
+        // Reads through the reference (stale until a focus event) — acceptable
+        // here because selection changes coincide with scene-focus events, unlike
+        // split-tree mutations which fire with focus steady. Don't copy this for
+        // split state; that's what the focused value above is for.
         if focusedModel?.selectedShell != nil { return String(localized: "Close Terminal") }
         return String(localized: "Close")
     }
