@@ -54,7 +54,7 @@ All in `Sources/HerdrM` (`AppModel.swift`, `ContentView.swift`,
   `pane read --source recent` returns full history; a fresh attach draws a
   full screen including history lines). This matters for the surviving
   re-attach paths (takeover recovery, reconnect overlay): visible content is
-  resync window can drop.
+  preserved; only lines older than the resync window can drop.
 
 ## Design
 
@@ -98,6 +98,14 @@ indirect enum SplitNode: Equatable {
   `terminalEntries(for:)` for cwd) and replaces that leaf with
   `split(axis, ratio: 0.5, first: <old leaf>, second: <new terminal>)`.
   The new pane always goes second (right/bottom), matching today.
+- Same-device guard: a tree lives in exactly one tab on one device. When a
+  tree exists and the focused leaf is `.agent`, splitting requires
+  `selectedAttachedEntry` to be on the tree's device (the device of any
+  terminal leaf — resolved by walking the tree); otherwise the command
+  no-ops. Without this, switching devices with a tree open and pressing ⌘D
+  would nest a foreign device's pane into the tree, breaking structure
+  agreement and closing panes across devices on collapse. (Terminal-leaf
+  splits always use the pane's own device and cannot cross.)
 - Mid-flight guards, adapted per leaf (not reused verbatim):
   - In-flight tasks are keyed per leaf
     (`splitOpenTasks: [SplitLeafID: Task<Void, Never>]`): repeat ⌘D on a
@@ -145,9 +153,8 @@ path. So the tree never owns views:
   "pixel-identical" gate will fail on rendering artifacts, not geometry.
   Pool membership ⟺ pane lifetime: views are added on open and
   removed only with their pane's close/death. **A live pane's view is never
-  removed, moved, or rebuilt — on split, collapse, re-aim, or resize, at
-  any depth.** This is the whole identity strategy, and it has no
-  exceptions.
+  removed, moved, or rebuilt — on split, collapse, or resize, at any
+  depth.** This is the whole identity strategy, and it has no exceptions.
 - **Geometry**: a pure function `layout(tree, size) -> [SplitLeafID: CGRect]`
   partitions the container rect recursively (axis + ratio per node). Each
   pooled view is positioned by its leaf's rect (`.frame` + `.position`) and
@@ -163,9 +170,9 @@ path. So the tree never owns views:
   and only shrinks, the new pane mounts fresh — and, crucially, the new
   pane's `makeNSView` auto-focuses it (inherited machinery, as today), so
   focusedSplitLeaf follows focus onto the new leaf and repeated ⌘D drills
-  deeper instead of piling onto one cell. State this focus handoff
-  explicitly: the rapid-⌘D test depends on it. No MVP limitation remains —
-  any binary guillotine layout is reachable.
+  deeper instead of piling onto one cell (the rapid-⌘D test depends on this
+  handoff). No MVP limitation remains — any binary guillotine layout is
+  reachable.
 - Focus dimming generalizes today's `inactivePaneOpacity`: focused leaf
   full opacity, all others dimmed.
 
@@ -230,7 +237,7 @@ path. So the tree never owns views:
    computed shims during migration, remove at the end.
 2. `SplitCanvasView` (pool + `layout()` + divider overlay) in `DetailView`;
    depth-1 tree must render pixel-identical to today before proceeding —
-   *including* attach survival (no processkill, no `--takeover` relaunch,
+   *including* attach survival (no process kill, no `--takeover` relaunch,
    scrollback intact, no focus steal; verify herdr-side that sibling shells
    keep running).
 3. Focus tracker → leaf IDs (+ registry); menu rewritten
