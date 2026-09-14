@@ -140,6 +140,11 @@ final class AppModel: ObservableObject {
         guard let entry = selectedAttachedEntry,
               !attachSessions.contains(where: { $0.id == entry.id })
         else { return }
+        // Never mount a split member in the agent stack: the pool already
+        // attaches its pane, and a second --takeover would kick it (this is
+        // what sidebar concealment prevents; selection can still reach a
+        // member via restore fixup or server-focus fallback).
+        guard !isSplitPane(deviceID: entry.device.id, paneID: entry.ref.paneID) else { return }
         attachSessions.append(entry)
     }
     /// Finished agents the user has not opened since they flipped to `done`.
@@ -365,6 +370,19 @@ final class AppModel: ObservableObject {
         guard splitTree != nil, let owner = splitTreeOwner, let device = treeDevice() else { return nil }
         return "\(owner.isAgent ? "agent" : "terminal")-\(device.id.uuidString)-\(owner.paneID)"
     }
+    /// Which tree leaf a sidebar ref points at, if any — typing-agnostic
+    /// (a member running an agent CLI resolves as `.agent` elsewhere, but
+    /// its pane is still the tree's terminal leaf). The suspend gate and
+    /// member-focus both key off this, never off entry-ID strings.
+    func splitLeaf(matching ref: PaneRef) -> SplitLeafID? {
+        guard splitTree != nil, let device = treeDevice() else { return nil }
+        if ref.deviceID == device.id, let owner = splitTreeOwner, ref.paneID == owner.paneID {
+            return .agent
+        }
+        let key = Self.splitPaneKey(deviceID: ref.deviceID, paneID: ref.paneID)
+        guard treeSplitPaneKeys().contains(key) else { return nil }
+        return .pane(deviceID: ref.deviceID, paneID: ref.paneID)
+    }
     /// Whether the split is showing: a split is pinned to its owner's tab
     /// like a herdr tab, NOT following sidebar selection. While suspended
     /// (tree live, selection elsewhere) the pool stays mounted but hidden —
@@ -372,8 +390,8 @@ final class AppModel: ObservableObject {
     /// no-ops except server-side prune (a pane dying while suspended still
     /// leaves the tree correctly).
     var isSplitActive: Bool {
-        guard let ownerID = splitOwnerEntryID else { return false }
-        return selectedAttachedEntry?.id == ownerID
+        guard let selection = selectedAttachedEntry else { return false }
+        return splitLeaf(matching: selection.ref) != nil
     }
     /// Snapshot waiting for its device data + selection to line up. Loaded
     /// once at launch; cleared on successful restore or when the owner pane
@@ -452,20 +470,8 @@ final class AppModel: ObservableObject {
             try container.encode(selected, forKey: .selected)
         }
 
-        /// Must equal `AttachedEntry.id` for the owner ("agent-<uuid>-<pane>"
-        /// / "terminal-<uuid>-<pane>") — the restore gate compares this.
-        var ownerEntryID: String {
-            Self.entryID(deviceID: deviceID, paneID: ownerPaneID, isAgent: ownerIsAgent)
-        }
-        /// Same shape for the quit-time selection.
-        var selectedEntryID: String {
-            Self.entryID(deviceID: selected.deviceID, paneID: selected.paneID, isAgent: selected.isAgent)
-        }
         var selectedRef: PaneRef { PaneRef(deviceID: selected.deviceID, paneID: selected.paneID) }
         var ownerRef: PaneRef { PaneRef(deviceID: deviceID, paneID: ownerPaneID) }
-        private static func entryID(deviceID: UUID, paneID: String, isAgent: Bool) -> String {
-            "\(isAgent ? "agent" : "terminal")-\(deviceID.uuidString)-\(paneID)"
-        }
         /// Every terminal pane the snapshot references, for the "quit while
         /// typing in a split pane" gate (selection may be a snapshot pane,
         /// not the owner, at relaunch).
@@ -622,16 +628,35 @@ final class AppModel: ObservableObject {
         // Inside the family (owner / quit-selection / snapshot panes):
         // anything else means the user's context moved on — wait for
         // switch-back instead of yanking them into our tab.
-        var family = Set([snapshot.ownerEntryID, snapshot.selectedEntryID])
-        family.formUnion(snapshot.terminalPaneIDs.map { "terminal-\(snapshot.deviceID.uuidString)-\($0)" })
-        guard let selection = selectedAttachedEntry, family.contains(selection.id) else { return }
+        // Compared by PaneRef (typing-agnostic): a member that flips
+        // terminal↔agent across the restart must still match.
+        let family = [snapshot.ownerRef, snapshot.selectedRef]
+            + snapshot.terminalPaneIDs.map { PaneRef(deviceID: snapshot.deviceID, paneID: $0) }
+        guard let selection = selectedAttachedEntry,
+              family.contains(where: { $0 == selection.ref })
+        else { return }
         func build(_ node: PersistedSplitNode) -> SplitNode? {
             switch node {
             case .agent:
                 return .leaf(.agent)
             case .terminal(let paneID):
-                guard let entry = terminalEntries(for: device).first(where: { $0.pane.paneID == paneID }) else { return nil }
-                return .leaf(.terminal(SplitPane(device: device, paneID: paneID, target: .terminal(terminalID: entry.terminalID))))
+                if let entry = terminalEntries(for: device).first(where: { $0.pane.paneID == paneID }) {
+                    return .leaf(.terminal(SplitPane(device: device, paneID: paneID, target: .terminal(terminalID: entry.terminalID))))
+                }
+                // A member running an agent CLI resolves as an agent
+                // server-side (ordinary-terminal lookup misses it): adopt
+                // under its agent identity so the column survives relaunch.
+                // Matched on bare pane ID — server pane IDs are stable for
+                // the daemon's lifetime, and the owner/device gate plus
+                // live re-resolution make a recycled-ID collision
+                // vanishingly unlikely; a wrong adoption would surface as
+                // one mis-attached column, never a pane kill.
+                // The pool re-resolves the live target every render, so a
+                // later flip back needs no tree surgery.
+                if session(device.id).agents.contains(where: { $0.paneID == paneID }) {
+                    return .leaf(.terminal(SplitPane(device: device, paneID: paneID, target: .agent(paneID: paneID))))
+                }
+                return nil
             case .split(let axis, let ratio, let first, let second):
                 let builtFirst = build(first)
                 let builtSecond = build(second)
@@ -661,7 +686,38 @@ final class AppModel: ObservableObject {
             }
             // Unknown (selected device not loaded yet): leave selection alone.
         }
+        // Pin ownership BEFORE adopting: the nil→live capture in
+        // updateSplitTree would otherwise re-derive the owner from whoever
+        // is selected now (possibly a member or a foreigner), and every
+        // owner-keyed machine below — col1 pin, member purge, owner mount,
+        // owner-gone hook — would pin, keep, and watch the wrong pane
+        // (double-attach via the exempted stack child, or nuke/strand via
+        // the hook).
+        splitTreeOwner = (paneID: snapshot.ownerPaneID, isAgent: snapshot.ownerIsAgent)
         updateSplitTree { $0 = restored }
+        // col1 renders the owner, which may never have been selected this
+        // launch (restore can land on a member first) — mount it, and evict
+        // split members from the agent stack (the pool owns their attaches;
+        // a second --takeover would kick the split's own).
+        if let owner = splitTreeOwner {
+            let ownerEntry: AttachedEntry? = {
+                if owner.isAgent, let info = session(device.id).agents.first(where: { $0.paneID == owner.paneID }) {
+                    return .agent(agentEntry(device: device, agent: info))
+                }
+                if let entry = terminalEntries(for: device).first(where: { $0.pane.paneID == owner.paneID }) {
+                    return .terminal(entry)
+                }
+                return nil
+            }()
+            if let ownerEntry, !attachSessions.contains(where: { $0.id == ownerEntry.id }) {
+                attachSessions.append(ownerEntry)
+            }
+        }
+        if let ownerID = splitOwnerEntryID {
+            attachSessions.removeAll {
+                $0.id != ownerID && isSplitPane(deviceID: $0.device.id, paneID: $0.ref.paneID)
+            }
+        }
         if let paneID = snapshot.focusedPaneID,
            treeContainsPane(deviceID: snapshot.deviceID, paneID: paneID) {
             focusedSplitLeaf = .pane(deviceID: snapshot.deviceID, paneID: paneID)
@@ -900,6 +956,11 @@ final class AppModel: ObservableObject {
         var entries = devicesInScope.flatMap { device in
             session(device.id).agents.map { agentEntry(device: device, agent: $0) }
         }
+        // A split member running an agent CLI is an agent server-side but a
+        // terminal leaf in the tree: selecting it from here would double-
+        // attach it under --takeover (pool + agent stack). Members are
+        // reached by focusing their column, never from the sidebar.
+        entries.removeAll(where: { isSplitPane(deviceID: $0.device.id, paneID: $0.agent.paneID) })
         if let space = selectedSpace {
             entries = entries.filter {
                 $0.device.id == space.deviceID && $0.agent.workspaceID == space.workspaceID
@@ -1346,10 +1407,16 @@ final class AppModel: ObservableObject {
     /// to reach it (it is hidden everywhere).
     func collapseSplitTree() {
         // Dismissing another tab's suspended split would nuke live panes the
-        // user can't even see — only the active tab collapses itself. The
-        // selectionless teardown (nothing showing, nothing to surprise) is
-        // the one exception.
-        guard isSplitActive || selectedAttachedEntry == nil else { return }
+        // user can't even see — only the active tab collapses itself.
+        // Selection loss suspends (the refresh fallback re-selects within
+        // the same tick); the owner-gone hook below is the only other caller.
+        guard isSplitActive else { return }
+        forceCollapseSplitTree()
+    }
+
+    /// Unconditional collapse for the owner-gone hook: the owner's tab is
+    /// over, so its split panes have no UI left to reach them.
+    private func forceCollapseSplitTree() {
         splitOpenTasks.values.forEach { $0.cancel() }
         splitOpenTasks.removeAll()
         guard splitTree != nil else { return }
@@ -2039,6 +2106,14 @@ final class AppModel: ObservableObject {
             if let selected = selectedPane, selected.deviceID == deviceID,
                !paneIDs.contains(selected.paneID) {
                 selectedPane = nil
+            }
+            // The owner's tab is over: its split panes would strand (alive
+            // server-side, concealed everywhere, nothing left to reach them),
+            // so close them with the tab. Member panes dying is handled by
+            // pool onExit prune instead — never here.
+            if splitTree != nil, let owner = splitTreeOwner, let treeDev = treeDevice(),
+               treeDev.id == deviceID, !paneIDs.contains(owner.paneID) {
+                forceCollapseSplitTree()
             }
             if let space = selectedSpace, space.deviceID == deviceID,
                !snapshot.workspaces.contains(where: { $0.workspaceID == space.workspaceID }) {
