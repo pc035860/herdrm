@@ -51,6 +51,7 @@ struct RootView: View {
         )
         .focusedSceneValue(\.appModel, model)
         .focusedSceneValue(\.splitTree, model.splitTree)
+        .focusedSceneValue(\.splitTreeActive, model.isSplitActive)
         .sheet(isPresented: $model.showSearch) { SearchSheet(model: model) }
         .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: 980, minHeight: 620)
@@ -267,22 +268,30 @@ struct DetailView: View {
                 .zIndex(1)
             Rectangle().fill(Theme.hairline).frame(height: 1)
             detailContent
-                // Losing the selected agent must collapse the tree: without this
-                // the split would outlive its agent — a phantom split the next ⌘W
-                // would "close" instead of the window, and a deferred focus request
-                // could arm into a tree with nothing left to consume it.
+                // Losing the selected agent suspends the split (the refresh
+                // fallback re-selects within the same tick); it must NOT
+                // collapse the tree — sidebar-closing one pane used to
+                // massacre its live siblings through this handler. The
+                // owner-gone hook in performRefresh is the only collapse on
+                // disappearance.
                 //
-                // Load-bearing beyond that: this is the ONLY thing that collapses
-                // the tree when the agent goes away. `dismantleNSView` nils the
-                // coordinator's onExit before killing the shell, so the shell's
-                // own onExit never fires on teardown.
+                // Load-bearing: the placeholder tore every kept-alive attach
+                // down along with the canvas. Empty the session list and
+                // per-entry state so a later selection doesn't resurrect
+                // them all at once.
                 .onChange(of: model.selectedAttachedEntry?.id) { _, id in
                     if id == nil {
-                        model.collapseSplitTree()
-                        // The placeholder tore every kept-alive attach down along with
-                        // the canvas. Empty the session list and per-entry state
-                        // so a later selection doesn't resurrect them all at once.
-                        model.attachSessions = []
+                        // (collapseSplitTree deliberately absent — see above)
+                        // The placeholder tore every kept-alive attach down
+                        // along with the canvas: empty the session list so a
+                        // later selection doesn't resurrect them all at once —
+                        // except the split owner's, which a live tree still
+                        // needs for col1 (the refresh fallback re-selects
+                        // within the same tick anyway).
+                        let keepOwner = model.splitTree.flatMap { _ in model.splitOwnerEntryID }.flatMap { id in
+                            model.attachSessions.first(where: { $0.id == id })
+                        }
+                        model.attachSessions = keepOwner.map { [$0] } ?? []
                         endedAttach = [:]
                         attachRetry = [:]
                     }
@@ -503,39 +512,53 @@ struct DetailView: View {
                 model.splitTree,
                 in: CGRect(origin: .zero, size: proxy.size)
             )
+            // Pinned to the owner's tab: a foreign selection suspends the
+            // split (selected entry fullscreen, pool mounted but hidden so
+            // the attaches survive) instead of recomposing col1 around the
+            // selection like a herdr tab never would.
+            let active = model.isSplitActive
+            let fullRect = CGRect(origin: .zero, size: proxy.size)
             ZStack(alignment: .topLeading) {
                 if let agentRect = layout.leaves[.agent] {
+                    let rect = active ? agentRect : fullRect
                     // One structural position holding every kept-alive attach. Each child
                     // keeps a stable identity and is toggled by opacity, so switching the
                     // selection never tears a terminal down: its content survives the
                     // round trip. Do not key this on the selection; that rebuild-on-switch
                     // is exactly what this removes.
+                    // col1 is pinned to the owner: selecting a member moves
+                    // focus, never recomposes the column (herdr tabs don't
+                    // reshape around the sidebar either).
+                    let agentDisplayID = active ? (model.splitOwnerEntryID ?? entry.id) : entry.id
                     ZStack {
                         ForEach(model.attachSessions) { session in
-                            attachChild(session, isSelected: session.id == entry.id)
+                            attachChild(session, isSelected: session.id == agentDisplayID)
                         }
                     }
-                    .frame(width: agentRect.width, height: agentRect.height)
-                    .position(x: agentRect.midX, y: agentRect.midY)
-                    .opacity(canvasOpacity(for: .agent))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                    .opacity(active ? canvasOpacity(for: .agent) : 1.0)
                 }
                 ForEach(model.poolSplitPanes(), id: \.poolID) { pane in
                     if let rect = layout.leaves[.pane(deviceID: pane.device.id, paneID: pane.paneID)] {
                         splitPoolChild(pane)
                             .frame(width: rect.width, height: rect.height)
                             .position(x: rect.midX, y: rect.midY)
-                            .opacity(canvasOpacity(for: .pane(deviceID: pane.device.id, paneID: pane.paneID)))
+                            .opacity(active ? canvasOpacity(for: .pane(deviceID: pane.device.id, paneID: pane.paneID)) : 0)
+                            .allowsHitTesting(active)
                     }
                 }
-                ForEach(layout.dividers) { divider in
-                    SplitCanvasDivider(
-                        axis: divider.axis,
-                        ratio: divider.ratio,
-                        total: divider.extent,
-                        onDrag: { model.setSplitRatio($0, at: divider.path) }
-                    )
-                    .frame(width: divider.rect.width, height: divider.rect.height)
-                    .position(x: divider.rect.midX, y: divider.rect.midY)
+                if active {
+                    ForEach(layout.dividers) { divider in
+                        SplitCanvasDivider(
+                            axis: divider.axis,
+                            ratio: divider.ratio,
+                            total: divider.extent,
+                            onDrag: { model.setSplitRatio($0, at: divider.path) }
+                        )
+                        .frame(width: divider.rect.width, height: divider.rect.height)
+                        .position(x: divider.rect.midX, y: divider.rect.midY)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -551,13 +574,34 @@ struct DetailView: View {
     /// (same device), attached like any terminal \u2014 not a local shell. The id
     /// keys the attach to its pane so a new split rebuilds cleanly; the pool
     /// (keyed by `poolID`) keeps it mounted until its pane closes.
+    /// The pool's live attach target: a member may flip between terminal and
+    /// agent (an agent CLI starting inside the pane changes its server-side
+    /// type) without any tree surgery, so resolve per render. The flavor in
+    /// the view id remounts the attach on flip — re-attaching correctly beats
+    /// keeping a stale attach that the server then drops (which would prune
+    /// a live pane as a ghost).
+    private func splitPoolTarget(for pane: AppModel.SplitPane) -> (target: TerminalAttachTarget, capabilities: AgentAttachmentCapabilities?, flavor: String) {
+        if let info = model.session(pane.device.id).agents.first(where: { $0.paneID == pane.paneID }) {
+            return (
+                .agent(paneID: pane.paneID),
+                model.attachmentCapabilities(deviceID: pane.device.id, agentKind: info.agentKindRaw),
+                "a"
+            )
+        }
+        if let entry = model.terminalEntries(for: pane.device).first(where: { $0.pane.paneID == pane.paneID }) {
+            return (.terminal(terminalID: entry.terminalID), nil, "t-\(entry.terminalID)")
+        }
+        return (pane.target, nil, "x")
+    }
+
     @ViewBuilder
     private func splitPoolChild(_ pane: AppModel.SplitPane) -> some View {
+        let resolved = splitPoolTarget(for: pane)
         AttachTerminalView(
             device: pane.device,
-            target: pane.target,
+            target: resolved.target,
             serverVersion: model.serverVersion(deviceID: pane.device.id),
-            attachmentCapabilities: nil,
+            attachmentCapabilities: resolved.capabilities,
             fontName: terminalFontName,
             fontSize: terminalFontSize,
             thinStrokes: terminalThinStrokes,
@@ -568,16 +612,18 @@ struct DetailView: View {
             onAttachmentError: { model.actionError = $0 },
             // A pooled pane dying (takeover, closed elsewhere) prunes just its
             // leaf — never the whole-tree funnel, which would nuke live siblings.
+            // Focus follows only when showing: while suspended the keyboard
+            // stays where the selection put it.
             onExit: { [weak model] _ in
                 model?.closeSplitLeaf(.pane(deviceID: pane.device.id, paneID: pane.paneID))
-                if let model { model.focusSplitLeaf(model.focusedSplitLeaf) }
+                if let model, model.isSplitActive { model.focusSplitLeaf(model.focusedSplitLeaf) }
             },
             onViewReady: {
                 SplitLeafViewRegistry.register($0, for: .pane(deviceID: pane.device.id, paneID: pane.paneID))
                 model.splitShellView = $0
             }
         )
-        .id("split-\(pane.paneID)")
+        .id("split-\(pane.paneID)-\(resolved.flavor)")
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         // Same solid-backdrop treatment as attachChild: Ghostty's non-opaque
@@ -655,10 +701,29 @@ struct DetailView: View {
             }
             .onChange(of: entry.id) { _, newID in
                 uploadingAttachment = false
-                // A re-selected kept-alive view does not self-focus (makeNSView ran once
-                // at creation), so hand it the keyboard explicitly — matching how every
-                // selection used to focus the freshly built terminal.
-                AttachViewRegistry.focus(newID)
+                // Selecting a split member focuses its column (the split
+                // stays identical — only focus moves, herdr-tab semantics).
+                // Anything else keeps the legacy handoff to the agent stack.
+                if model.isSplitActive,
+                   let selection = model.selectedAttachedEntry,
+                   let leaf = model.splitLeaf(matching: selection.ref) {
+                    // Registered-view check first: on the very first render
+                    // after adoption the pool may not have mounted yet —
+                    // claiming focus then leaves focusedSplitLeaf disagreeing
+                    // with the keyboard (and misroutes a fast ⌘W). Fall back
+                    // to the legacy handoff until the tracker reports.
+                    if leaf == .agent || SplitLeafViewRegistry.view(for: leaf) != nil {
+                        model.focusedSplitLeaf = leaf
+                        model.focusSplitLeaf(leaf)
+                    } else {
+                        AttachViewRegistry.focus(newID)
+                    }
+                } else {
+                    // A re-selected kept-alive view does not self-focus (makeNSView ran once
+                    // at creation), so hand it the keyboard explicitly — matching how every
+                    // selection used to focus the freshly built terminal.
+                    AttachViewRegistry.focus(newID)
+                }
             }
             // Keyed on the window becoming key rather than on a delay: that is the event
             // that follows the sheet's responder restore. Filtered to the terminal's own
@@ -672,6 +737,14 @@ struct DetailView: View {
                       window === model.splitAgentView?.window
                 else { return }
                 focusTerminal(model.splitAgentView)
+            }
+            // Resuming the owner's tab hands the keyboard back to the leaf
+            // that held it (suspending never touched focus — the selection's
+            // own handoff put it on the foreign entry).
+            .onChange(of: model.isSplitActive) { _, active in
+                if active {
+                    model.focusSplitLeaf(model.focusedSplitLeaf)
+                }
             }
             // Splitting moves the keyboard to the new pane, so the tree going
             // away has to hand it back — by ⌘W, by the last leaf closing, or

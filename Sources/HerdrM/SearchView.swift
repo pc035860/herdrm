@@ -28,7 +28,11 @@ struct SearchSheet: View {
         let agents = model.devices.flatMap { device in
             model.session(device.id).agents.map { model.agentEntry(device: device, agent: $0) }
         }.filter { entry in
-            q.isEmpty
+            // Split members running an agent CLI are agents server-side but
+            // tree leaves: revealing one would double-attach it under
+            // --takeover (same concealment as the sidebar).
+            guard !model.isSplitPane(deviceID: entry.device.id, paneID: entry.agent.paneID) else { return false }
+            return q.isEmpty
                 || entry.title.lowercased().contains(q)
                 || entry.agent.title.lowercased().contains(q)
                 || entry.agent.agent.lowercased().contains(q)
